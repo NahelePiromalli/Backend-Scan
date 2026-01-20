@@ -4,6 +4,7 @@ import pefile
 import subprocess
 import ctypes
 import sys
+import uuid
 import hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog
@@ -20,6 +21,7 @@ import shutil
 import re 
 import math
 from collections import Counter
+import yara
 
 # --- FUNCIÓN PARA RUTAS RELATIVAS (NECESARIA PARA NUITKA) ---
 def resource_path(relative_path):
@@ -154,6 +156,22 @@ USER_EXPIRY = None
 cancelar_escaneo = False
 cola_vt = Queue()
 reporte_vt = "detecciones_virustotal.txt"
+
+# --- SISTEMA YARA ---
+GLOBAL_YARA_RULES = None
+
+def inicializar_yara():
+    global GLOBAL_YARA_RULES
+    archivo_reglas = resource_path("reglas_scanneler.yar")
+    if os.path.exists(archivo_reglas):
+        try:
+            GLOBAL_YARA_RULES = yara.compile(filepath=archivo_reglas)
+            print(f"[OK] Motor YARA cargado: {archivo_reglas}")
+        except Exception as e:
+            print(f"[ERROR] Fallo al compilar reglas YARA: {e}")
+            GLOBAL_YARA_RULES = None
+    else:
+        print("[ALERTA] No se encontró reglas_scanneler.yar. Usando modo degradado.")
 
 # Variables Globales de Reportes
 reporte_shim = ""
@@ -610,39 +628,129 @@ def fase_nombre_original(vt, palabras, modo):
         else:
             f.write("No identity mismatches found.\n")
 
+# =============================================================================
+# [NATIVE] VERIFICADOR DE FIRMAS (WinVerifyTrust)
+# =============================================================================
+def verificar_firma_nativa(filepath):
+    """
+    Verifica la firma digital de un archivo usando la API nativa de Windows (wintrust.dll).
+    Retorna: (bool_valido, str_estado)
+    """
+    try:
+        wintrust = ctypes.windll.wintrust
+        
+        # Estructuras necesarias para WinAPI
+        class WINTRUST_FILE_INFO(ctypes.Structure):
+            _fields_ = [
+                ("cbStruct", ctypes.c_ulong),
+                ("pcwszFilePath", ctypes.c_wchar_p),
+                ("hFile", ctypes.c_void_p),
+                ("pgKnownSubject", ctypes.c_void_p)
+            ]
+
+        class WINTRUST_DATA(ctypes.Structure):
+            _fields_ = [
+                ("cbStruct", ctypes.c_ulong),
+                ("dwPolicyCallbackData", ctypes.c_void_p),
+                ("dwSIPClientData", ctypes.c_void_p),
+                ("dwUIChoice", ctypes.c_ulong),
+                ("fdwRevocationChecks", ctypes.c_ulong),
+                ("dwUnionChoice", ctypes.c_ulong),
+                ("pFile", ctypes.c_void_p),
+                ("dwStateAction", ctypes.c_ulong),
+                ("hWVTStateData", ctypes.c_void_p),
+                ("pwszURLReference", ctypes.c_wchar_p),
+                ("dwProvFlags", ctypes.c_ulong),
+                ("dwUIContext", ctypes.c_ulong),
+                ("pSignatureSettings", ctypes.c_void_p)
+            ]
+
+        # GUID para acción genérica de verificación (WINTRUST_ACTION_GENERIC_VERIFY_V2)
+        # {00AAC56B-CD44-11d0-8CC2-00C04FC295EE}
+        guid_bytes = uuid.UUID('{00AAC56B-CD44-11d0-8CC2-00C04FC295EE}').bytes_le
+        p_guid = ctypes.create_string_buffer(guid_bytes)
+
+        # Configurar Info del Archivo
+        file_info = WINTRUST_FILE_INFO()
+        file_info.cbStruct = ctypes.sizeof(WINTRUST_FILE_INFO)
+        file_info.pcwszFilePath = filepath
+        file_info.hFile = None
+        file_info.pgKnownSubject = None
+
+        # Configurar Datos de Confianza
+        trust_data = WINTRUST_DATA()
+        trust_data.cbStruct = ctypes.sizeof(WINTRUST_DATA)
+        trust_data.dwUIChoice = 2  # WTD_UI_NONE (Sin GUI)
+        trust_data.fdwRevocationChecks = 0  # WTD_REVOKE_NONE (Rápido, sin chequear online CRL)
+        trust_data.dwUnionChoice = 1  # WTD_CHOICE_FILE
+        trust_data.pFile = ctypes.pointer(file_info)
+        trust_data.dwStateAction = 1  # WTD_STATEACTION_VERIFY
+        trust_data.dwProvFlags = 0x00000010 | 0x00000800 # Cache Only + Safer Flag
+
+        # Ejecutar Verificación
+        status = wintrust.WinVerifyTrust(None, p_guid, ctypes.byref(trust_data))
+        
+        # Limpiar memoria (Close Action)
+        trust_data.dwStateAction = 2 # WTD_STATEACTION_CLOSE
+        wintrust.WinVerifyTrust(None, p_guid, ctypes.byref(trust_data))
+
+        # 0 = TRUST_E_SUCCESS (Firmado y Confiable)
+        if status == 0:
+            return True, "VALID_TRUSTED"
+        
+        # Códigos de error comunes
+        errores = {
+            0x800B0100: "NO_SIGNATURE",
+            0x800B0101: "EXPIRED",
+            0x800B0109: "UNTRUSTED_ROOT",
+            0x80096010: "BAD_DIGEST" # Archivo modificado
+        }
+        return False, errores.get(status, f"INVALID_CODE_{hex(status)}")
+            
+    except Exception as e:
+        return False, f"ERROR_API: {str(e)}"
+
+# --- FASE PRINCIPAL ---
+
 def fase_verificar_firmas(palabras, vt, modo):
     if cancelar_escaneo: return
-    print(f"[4/25] Digital Signature (Speed-Demon Optimization) [LETHAL]...")
+    print(f"[4/25] Digital Signature (Deep Recursive + Native API) [LETHAL SPEED]...")
 
     global reporte_firmas
     base_path = HISTORIAL_RUTAS.get('path', os.path.abspath("."))
     folder_name = HISTORIAL_RUTAS.get('folder', "Resultados_SS")
     reporte_firmas = os.path.join(base_path, folder_name, "Digital_Signatures_ZeroTrust.txt")
 
-    # Firmas en las que confiamos (Whitelist)
-    trusted_issuers = [
-        "microsoft", "windows", "google", "mozilla", "nvidia", "intel", "amd", 
-        "realtek", "valve", "epic games", "riot games", "battleye", "easyanticheat",
-        "discord", "spotify", "logitech", "razer", "corsair", "hp inc", "dell", 
-        "lenovo", "adobe", "oracle", "citizenfx", "roblox", "mojang", "teamviewer",
-        "obs project", "elgato", "asustek", "msi", "gigabyte", "opera", "brave"
-    ]
-
-    # --- LISTA NEGRA AGRESIVA (Aquí está la velocidad) ---
-    # Ignoramos carpetas del sistema y bibliotecas de juegos gigantes.
-    # El cheat NO suele estar aquí. Si está en C:\Hacks, lo leeremos.
-    skipped_dirs = [
-        "windows", "program files", "program files (x86)", "programdata", 
-        "$recycle.bin", "system volume information", "msocache", "perflogs", "boot",
-        "steamlibrary", "steamapps", "riot games", "epic games", "ubisoft", "origin games"
-    ]
+    # --- LISTAS INTELIGENTES PARA MANTENER LA VELOCIDAD ---
+    # Extensiones peligrosas que deben tener firma (o ser scripts sospechosos)
+    target_exts = ('.exe', '.dll', '.sys', '.bat', '.ps1', '.vbs', '.ahk', '.lua', '.py', '.tmp')
+    
+    # Carpetas "Agujero Negro" (Si entras aquí, el escaneo se muere. Las saltamos.)
+    # Esto es el secreto para que sea RÁPIDO aunque sea recursivo.
+    ignored_folders = {
+        "node_modules", ".git", ".vs", "__pycache__", "vendor", "lib", "libs", "include",
+        "steamapps", "riot games", "epic games", "ubisoft", "program files", "windows"
+    }
 
     files_to_scan = set()
-    files_needing_verification = []
-    findings_unsigned = []
-    findings_untrusted = []
 
-    # 1. PROCESOS ACTIVOS (Prioridad Absoluta - Lo atrapamos si está abierto)
+    # 1. DEFINIR ZONAS DE CAZA (Ahora recursivas)
+    user_profile = os.environ["USERPROFILE"]
+    deep_zones = [
+        os.path.join(user_profile, "Desktop"),
+        os.path.join(user_profile, "Downloads"),
+        os.path.join(user_profile, "AppData", "Local", "Temp"),
+        # AppData Roaming suele tener mucha basura, escaneamos solo la raiz o carpetas específicas si quieres
+        os.path.join(user_profile, "AppData", "Roaming")
+    ]
+    
+    # Soporte OneDrive
+    onedrive = os.path.join(user_profile, "OneDrive")
+    if os.path.exists(onedrive):
+        deep_zones.append(os.path.join(onedrive, "Desktop"))
+        deep_zones.append(os.path.join(onedrive, "Downloads")) # A veces está aquí
+
+    # 2. PROCESOS ACTIVOS (Siempre prioridad)
     try:
         cmd = 'wmic process get ExecutablePath /format:csv'
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, creationflags=0x08000000)
@@ -654,129 +762,74 @@ def fase_verificar_firmas(palabras, vt, modo):
                     if path and os.path.exists(path): files_to_scan.add(path)
     except: pass
 
-    # 2. ZONAS CALIENTES + ONEDRIVE (Prioridad Alta)
-    user_profile = os.environ["USERPROFILE"]
-    hot_dirs = [
-        os.path.join(user_profile, "Desktop"),
-        os.path.join(user_profile, "Downloads"),
-        os.path.join(user_profile, "AppData", "Local", "Temp"),
-        os.path.join(user_profile, "AppData", "Roaming")
-    ]
-    # Soporte OneDrive
-    onedrive_path = os.path.join(user_profile, "OneDrive")
-    if os.path.exists(onedrive_path):
-        hot_dirs.append(os.path.join(onedrive_path, "Desktop"))
+    # 3. RECOLECCIÓN RECURSIVA ULTRA-RÁPIDA
+    # Usamos os.walk pero podando el árbol de directorios
+    for zone in deep_zones:
+        if not os.path.exists(zone): continue
+        
+        # Limite de seguridad: Si la carpeta es Roaming, no profundizamos tanto para no tardar años
+        max_depth = 5 if "AppData" in zone else 10 
+        root_depth = zone.count(os.sep)
 
-    for d in hot_dirs:
-        if os.path.exists(d):
-            try:
-                with os.scandir(d) as entries:
-                    for entry in entries:
-                        if entry.is_file() and entry.name.lower().endswith((".exe", ".dll", ".sys", ".bat")):
-                            files_to_scan.add(entry.path)
-            except: pass
-
-    # 3. BARRIDO DE DISCO INTELIGENTE (Todas las unidades, saltando basura)
-    drives = []
-    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-    for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-        if bitmask & 1: drives.append(f"{letter}:\\")
-        bitmask >>= 1
-
-    for drive in drives:
-        if cancelar_escaneo: break
-        # Topdown=True es vital para poder modificar 'dirs' en vuelo
-        for root, dirs, files in os.walk(drive, topdown=True):
+        for root, dirs, files in os.walk(zone, topdown=True):
             if cancelar_escaneo: break
             
-            # MAGIA DE OPTIMIZACIÓN:
-            # Eliminamos de la lista 'dirs' las carpetas prohibidas.
-            # os.walk NO entrará en ellas, ahorrando millones de ciclos.
-            dirs[:] = [d for d in dirs if d.lower() not in skipped_dirs]
+            # A. Optimización: Podar carpetas basura en tiempo real
+            dirs[:] = [d for d in dirs if d.lower() not in ignored_folders and not d.startswith('.')]
             
+            # B. Control de profundidad
+            current_depth = root.count(os.sep)
+            if current_depth - root_depth > max_depth:
+                del dirs[:] # Dejar de bajar en esta rama
+                continue
+
             for name in files:
-                if name.lower().endswith((".exe", ".dll", ".sys")):
+                if name.lower().endswith(target_exts):
                     full_path = os.path.join(root, name)
-                    
-                    # FILTRO DE TAMAÑO: Cheats son pequeños (<30MB). Juegos son grandes.
+                    # Filtro de tamaño: Opcional, para no escanear ISOs gigantes renombradas a .exe
                     try:
-                        if os.path.getsize(full_path) < 30 * 1024 * 1024: 
+                        if os.path.getsize(full_path) < 150 * 1024 * 1024: # < 150MB
                             files_to_scan.add(full_path)
                     except: pass
 
-    # 4. ANÁLISIS DE CANDIDATOS (PE + PowerShell)
-    for file_path in files_to_scan:
-        if cancelar_escaneo: break
-        
-        try:
-            # Check rápido de cabecera PE (Milisegundos)
-            # Si no tiene slot de seguridad, es unsigned seguro.
-            pe = pefile.PE(file_path, fast_load=True)
-            has_signature_slot = False
-            sec = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']]
-            if sec.VirtualAddress != 0 and sec.Size > 0: 
-                has_signature_slot = True
-            pe.close()
-
-            if not has_signature_slot:
-                findings_unsigned.append(f"[UNSIGNED] {os.path.basename(file_path)} | Path: {file_path}")
-                if vt: cola_vt.put(file_path)
-            else:
-                # Solo verificamos con PowerShell si PARECE tener firma
-                files_needing_verification.append(file_path)
-
-        except Exception:
-            # Si pefile explota, es un archivo corrupto/protegido -> SOSPECHOSO -> Verificar igual
-            files_needing_verification.append(file_path)
-
-    # 5. BATCH PROCESSING (PowerShell)
-    def chunks(lst, n):
-        for i in range(0, len(lst), n): yield lst[i:i + n]
-
-    batch_size = 50 # Procesamos de a 50 archivos para no saturar RAM
-    for batch in chunks(files_needing_verification, batch_size):
-        if cancelar_escaneo: break
-        paths_str = ",".join([f"'{p.replace('\'', '\'\'')}'" for p in batch])
-        ps_cmd = f"$paths = @({paths_str}); $paths | ForEach-Object {{ $sig = Get-AuthenticodeSignature -LiteralPath $_; $signer = if ($sig.SignerCertificate) {{ $sig.SignerCertificate.Subject }} else {{ 'NULL' }}; $status = $sig.Status; \"$_|$status|$signer\" }}"
-        
-        try:
-            proc = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, creationflags=0x08000000)
-            for line in proc.stdout.splitlines():
-                if "|" in line:
-                    parts = line.split("|")
-                    if len(parts) >= 3:
-                        f_path = parts[0]
-                        f_status = parts[1]
-                        f_signer_raw = parts[2].lower()
-                        f_name = os.path.basename(f_path)
-                        clean_signer = f_signer_raw.replace("cn=", "").split(",")[0].strip()
-                        
-                        if f_status != "Valid":
-                            findings_unsigned.append(f"[INVALID SIG] {f_name} | Status: {f_status} | Path: {f_path}")
-                            if vt: cola_vt.put(f_path)
-                        else:
-                            if not any(t in f_signer_raw for t in trusted_issuers):
-                                findings_untrusted.append(f"[UNTRUSTED] {f_name}\n      Signer: {clean_signer.upper()}\n      Path: {f_path}")
-                                if vt: cola_vt.put(f_path)
-        except: pass
-
-    # 6. REPORTE
+    # 4. EJECUCIÓN DEL ANÁLISIS (WinAPI)
+    scanned_count = 0
+    unsigned_count = 0
+    
     with open(reporte_firmas, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== DIGITAL SIGNATURE & ZERO-TRUST REPORT: {datetime.datetime.now()} ===\n")
-        f.write(f"Scope: FULL DISK (Aggressive Filter Active)\n")
-        f.write(f"Files Analyzed: {len(files_to_scan)}\n\n")
+        f.write(f"=== DIGITAL SIGNATURE DEEP SCAN: {datetime.datetime.now()} ===\n")
+        f.write(f"Engine: Native WinVerifyTrust | Scope: Recursive (Smart Filter)\n")
+        f.write(f"Targets Identified: {len(files_to_scan)}\n\n")
         
-        f.write(f"--- SECTION 1: UNSIGNED / BROKEN BINARIES (High Risk: {len(findings_unsigned)}) ---\n")
-        if findings_unsigned:
-            for item in findings_unsigned: f.write(item + "\n"); f.flush()
-        else: f.write("[OK] No unsigned binaries found in scan scope.\n")
-        
-        f.write("\n" + "="*60 + "\n\n")
-        
-        f.write(f"--- SECTION 2: UNTRUSTED SIGNERS (Zero Trust: {len(findings_untrusted)}) ---\n")
-        if findings_untrusted:
-            for item in findings_untrusted: f.write(item + "\n" + "-"*40 + "\n"); f.flush()
-        else: f.write("[OK] All signed files belong to Trusted Vendors.\n")
+        for file_path in files_to_scan:
+            if cancelar_escaneo: break
+            scanned_count += 1
+            
+            # Verificación
+            # NOTA: Los scripts (.lua, .ahk) siempre darán "NO_SIGNATURE", lo cual es bueno porque los reportará.
+            is_valid, status_msg = verificar_firma_nativa(file_path)
+            file_name = os.path.basename(file_path)
+            
+            if not is_valid:
+                unsigned_count += 1
+                f.write(f"[!!!] POTENTIAL THREAT (Unsigned): {file_name}\n")
+                f.write(f"      Path: {file_path}\n")
+                f.write(f"      Sign Status: {status_msg}\n")
+                
+                # Heurística extra para scripts (Tessio, etc.)
+                ext = os.path.splitext(file_name)[1].lower()
+                if ext in ['.lua', '.ahk', '.py', '.bat']:
+                    f.write(f"      Type: SCRIPT FILE (High Risk if hidden)\n")
+                
+                f.write("-" * 40 + "\n")
+                f.flush()
+                
+                if vt: cola_vt.put(file_path)
+
+            elif modo == "Analizar Todo":
+                f.write(f"[OK] {file_name} [Signed]\n")
+
+        f.write(f"\nScan Finished.\nTotal Files Checked: {scanned_count}\nUnsigned/Suspicious: {unsigned_count}")
         
 def fase_buscar_en_disco(kws):
     if cancelar_escaneo: return
@@ -1199,33 +1252,64 @@ def fase_process_hunter(palabras, modo):
 
 def fase_game_cheat_hunter(palabras, modo):
     if cancelar_escaneo: return
-    print(f"[15/24] Game Cheat Hunter (Modo: {modo}) [ULTRA DEEP SCAN]...")
-    internal_blackilst = ["cheat engine", "cheatengine", "process hacker", "kprocesshacker", "x64dbg", "ollydbg", "dnspy", "fiddler", "wireshark", "injector", "extreme injector", "xenos", "hacker", "ks dumper", "http debugger", "lag switch", "netlimiter"]
-    cheat_strings_bytes = [b"Aimbot", b"Wallhack", b"NoRecoil", b"SilentAim", b"Triggerbot", b"EspBox", b"GlowEsp", b"Bunnyhop", b"AutoStrafe", b"Rcs", b"NoFlash", b"NoSmoke", b"NoSpread", b"RapidFire", b"InfiniteAmmo", b"Spinbot", b"AntiAim", b"FakeLag", b"Resolver", b"Backtrack", b"DoubleTap", b"HideShots", b"MagicBullet", b"AutoWall", b"Desync", b"Chams", b"XQZ", b"Wireframe", b"SkeletonEsp", b"Hitbox", b"Snapline", b"HealthBar", b"ArmorBar", b"SpectatorList", b"RadarHack", b"FovChanger", b"ThirdPerson", b"SkinChanger", b"KnifeChanger", b"ImGui", b"ImVec2", b"ImVec4", b"ImDrawList", b"ImGui_ImplDX9", b"ImGui_ImplWin32", b"EndScene", b"Present", b"DrawIndexedPrimitive", b"wglSwapBuffers", b"D3D11CreateDevice", b"Swapchain", b"WriteProcessMemory", b"ReadProcessMemory", b"VirtualAllocEx", b"CreateRemoteThread", b"ManualMap", b"ReflectiveLoader", b"LdrLoadDll", b"NtCreateThreadEx", b"HijackHandle", b"UnlinkModule", b"CreateMove", b"FrameStageNotify", b"PaintTraverse", b"OverrideView", b"SceneEnd", b"DoPostScreenSpaceEffects", b"GetBoneMatrix", b"dwLocalPlayer", b"dwEntityList", b"dwClientState", b"m_iHealth", b"m_vecOrigin", b"m_vecViewOffset", b"m_iTeamNum", b"m_bSpotted", b"Load Config", b"Save Config", b"Cheat Menu", b"Hack Menu", b"ForceUi", b"Unload Cheat", b"SelfDestruct", b"PanicKey", b"Watermark", b"Auth", b"Login", b"Hwid", b"cheat.dll", b"hack.dll", b"injector.exe", b"loader.exe", b"aim.cpp", b"esp.cpp", b"menu.cpp", b"hooks.cpp", b"DetourTransaction", b"VirtualProtect", b"LoadLibraryA"]
+    print(f"[15/24] Game Cheat Hunter (YARA POWERED) [ULTRA DEEP SCAN]...")
+    
+    # Lista negra interna para nombres de archivos (Metadata)
+    internal_blackilst = ["cheat engine", "process hacker", "x64dbg", "ollydbg", "dnspy", "injector", "ks dumper", "http debugger", "netlimiter"]
+
     with open(reporte_game, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== GAME CHEAT HUNTER (ULTRA): {datetime.datetime.now()} ===\n"); f.write(f"Database: {len(cheat_strings_bytes)} signatures loaded.\n\n")
-        hot_paths = [os.path.join(os.environ["USERPROFILE"], "Downloads"), os.path.join(os.environ["USERPROFILE"], "Desktop"), os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Temp"), os.path.join(os.environ["USERPROFILE"], "AppData", "Roaming")]
+        f.write(f"=== GAME CHEAT HUNTER (YARA): {datetime.datetime.now()} ===\n")
+        
+        if GLOBAL_YARA_RULES is None:
+             f.write("[ERROR] YARA Rules not loaded. Skipping deep content scan.\n\n")
+        else:
+             f.write(f"Engine: YARA Active | Rules Loaded.\n\n")
+
+        hot_paths = [os.path.join(os.environ["USERPROFILE"], "Downloads"), 
+                     os.path.join(os.environ["USERPROFILE"], "Desktop"), 
+                     os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Temp"),
+                     os.path.join(os.environ["USERPROFILE"], "AppData", "Roaming")]
+
         for target_dir in hot_paths:
             if not os.path.exists(target_dir): continue
             f.write(f"--- Scanning: {target_dir} ---\n")
+            
             try:
+                # Escaneamos los 80 archivos más recientes
                 with os.scandir(target_dir) as entries:
                     files = sorted([e.path for e in entries if e.is_file() and e.name.lower().endswith(('.exe', '.dll', '.tmp', '.sys', '.bin', '.dat'))], key=os.path.getmtime, reverse=True)[:80]
+                
                 for file_path in files:
                     if cancelar_escaneo: break
-                    file_name = os.path.basename(file_path); suspicious = False; reason = ""; entropy_val = 0
+                    file_name = os.path.basename(file_path)
+                    suspicious = False
+                    reason = ""
+                    entropy_val = 0
+                    
                     try:
+                        # 1. Lectura y Entropía
                         with open(file_path, "rb") as bf:
-                            content = bf.read(15 * 1024 * 1024)
-                            entropy_val = calculate_entropy(content)
-                            if entropy_val > 7.4: suspicious = True; reason = f"HIGH ENTROPY ({entropy_val:.2f}): Possible Encrypted/Packed Hack"
-                            if not suspicious:
-                                hits = []
-                                for s in cheat_strings_bytes:
-                                    if s in content:
-                                        hits.append(s.decode('utf-8')); 
-                                        if len(hits) >= 2: break
-                                if hits: suspicious = True; reason = f"MALICIOUS STRINGS: {', '.join(hits)}"
+                            content = bf.read(15 * 1024 * 1024) # Leer primeros 15MB
+                            
+                        entropy_val = calculate_entropy(content)
+                        if entropy_val > 7.4: 
+                            suspicious = True
+                            reason = f"HIGH ENTROPY ({entropy_val:.2f}): Possible Packed/Encrypted Hack"
+
+                        # 2. ESCANEO CON YARA (Reemplaza el bucle for gigante anterior)
+                        if GLOBAL_YARA_RULES:
+                            try:
+                                # Escaneamos el contenido en memoria
+                                matches = GLOBAL_YARA_RULES.match(data=content)
+                                if matches:
+                                    suspicious = True
+                                    reglas_activadas = [m.rule for m in matches]
+                                    # Obtener detalles de qué strings detectó (opcional)
+                                    reason = f"YARA MATCH: {', '.join(reglas_activadas)}"
+                            except Exception as yara_e:
+                                print(f"Yara error on {file_name}: {yara_e}")
+
+                        # 3. Análisis de Metadata (PE)
                         if not suspicious:
                             try:
                                 pe = pefile.PE(file_path, fast_load=True)
@@ -1236,38 +1320,22 @@ def fase_game_cheat_hunter(palabras, modo):
                                                 for k, v in st.entries.items():
                                                     val_dec = v.decode('utf-8', 'ignore').lower()
                                                     for bad in internal_blackilst:
-                                                        if bad in val_dec: suspicious = True; reason = f"METADATA MATCH: {val_dec}"; break
+                                                        if bad in val_dec: 
+                                                            suspicious = True
+                                                            reason = f"METADATA MATCH: {val_dec}"
+                                                            break
                                 pe.close()
                             except: pass
-                    except: pass
-                    if suspicious: f.write(f"[!!!] CHEAT DETECTED: {file_name}\n      Path: {file_path}\n      Entropy: {entropy_val:.2f}\n      Reason: {reason}\n" + "-"*50 + "\n"); f.flush()
-                    elif modo == "Analizar Todo": f.write(f"[CLEAN] {file_name} (Ent: {entropy_val:.2f})\n"); f.flush()
+
+                    except Exception as e: pass
+
+                    if suspicious: 
+                        f.write(f"[!!!] CHEAT DETECTED: {file_name}\n      Path: {file_path}\n      Entropy: {entropy_val:.2f}\n      Reason: {reason}\n" + "-"*50 + "\n")
+                        f.flush()
+                    elif modo == "Analizar Todo": 
+                        f.write(f"[CLEAN] {file_name} (Ent: {entropy_val:.2f})\n")
+                        f.flush()
             except: pass
-        f.write("\n--- DELETED FILE EVIDENCE (USN Journal) ---\n")
-        try:
-            keywords = ["cheat", "hack", "injector", "esp", "aimbot", "loader"]
-            proc = subprocess.Popen('fsutil usn readjournal C: csv', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, creationflags=0x08000000)
-            count_found = 0; start_time = time.time()
-            while True:
-                if cancelar_escaneo or (time.time() - start_time > 5): break
-                line = proc.stdout.readline()
-                if not line: break
-                line_lower = line.lower()
-                if any(k in line_lower for k in keywords):
-                    if "windows" not in line_lower and "system32" not in line_lower: f.write(f"[JOURNAL TRACE] {line.strip()}\n"); f.flush(); count_found += 1
-                    if count_found > 15: break
-            proc.terminate()
-        except: pass
-        f.write("\n--- WINDOW TITLE SCAN ---\n")
-        try:
-            cmd = 'tasklist /v /fo csv'; proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, creationflags=0x08000000); out, _ = proc.communicate()
-            if out:
-                lines = out.splitlines()
-                for l in lines:
-                    low_l = l.lower()
-                    if "overlay" in low_l or "esp box" in low_l or " cheat" in low_l or "injector" in low_l or "external" in low_l:
-                         if "nvidia" not in low_l and "discord" not in low_l and "steam" not in low_l and "gamebar" not in low_l: f.write(f"[SUSPICIOUS WINDOW] {l.strip()}\n"); f.flush()
-        except: pass
 
 def fase_nuclear_traces(palabras, modo):
     if cancelar_escaneo: return
@@ -1625,47 +1693,166 @@ def fase_ghost_trails(palabras, modo):
 
 def fase_memory_anomaly(palabras, modo):
     if cancelar_escaneo: return
-    print(f"[22/24] Memory Anomaly Hunter (Manual Map Detection) [ELITE]...")
-    target_names = ["csgo.exe", "valorant.exe", "dota2.exe", "fortnite.exe", "javaw.exe", "explorer.exe", "svchost.exe", "discord.exe", "steam.exe"]
+    print(f"[22/24] Memory Anomaly Hunter (VAD + Orphan Threads) [GOD-TIER]...")
+
+    # --- 1. DEFINICIONES CTYPES PARA NIVEL KERNEL/NATIVO ---
+    # Definimos estructuras necesarias para consultar Hilos y Módulos
+    class MODULEENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("th32ModuleID", ctypes.c_ulong),
+                    ("th32ProcessID", ctypes.c_ulong), ("GlblcntUsage", ctypes.c_ulong),
+                    ("ProccntUsage", ctypes.c_ulong), ("modBaseAddr", ctypes.c_void_p),
+                    ("modBaseSize", ctypes.c_ulong), ("hModule", ctypes.c_void_p),
+                    ("szModule", ctypes.c_char * 256), ("szExePath", ctypes.c_char * 260)]
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                    ("th32ThreadID", ctypes.c_ulong), ("th32OwnerProcessID", ctypes.c_ulong),
+                    ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
+                    ("dwFlags", ctypes.c_ulong)]
+
+    TH32CS_SNAPMODULE = 0x00000008
+    TH32CS_SNAPMODULE32 = 0x00000010
+    TH32CS_SNAPTHREAD = 0x00000004
+    THREAD_QUERY_INFORMATION = 0x0040
+    STATUS_SUCCESS = 0
+
+    # Funciones nativas
+    ntdll = ctypes.windll.ntdll
+    kernel32 = ctypes.windll.kernel32
+
+    # --- HELPER: Obtener Rangos de Memoria Válidos (Módulos) ---
+    def get_valid_ranges(pid):
+        valid_ranges = [] # Lista de tuplas (inicio, fin, nombre)
+        h_snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        if h_snap == -1: return []
+        
+        me32 = MODULEENTRY32()
+        me32.dwSize = ctypes.sizeof(MODULEENTRY32)
+        
+        if kernel32.Module32First(h_snap, ctypes.byref(me32)):
+            while True:
+                start = me32.modBaseAddr if me32.modBaseAddr else 0
+                size = me32.modBaseSize
+                if start and size:
+                    end = start + size
+                    name = me32.szModule.decode('cp1252', 'ignore')
+                    valid_ranges.append((start, end, name))
+                if not kernel32.Module32Next(h_snap, ctypes.byref(me32)): break
+        kernel32.CloseHandle(h_snap)
+        return valid_ranges
+
+    # --- TARGET LIST ---
+    target_names = ["csgo.exe", "valorant.exe", "dota2.exe", "fortnite.exe", "javaw.exe", 
+                    "explorer.exe", "svchost.exe", "discord.exe", "steam.exe", "hl2.exe", 
+                    "gta5.exe", "fivem.exe", "robloxplayerbeta.exe", "minecraft.exe"]
+
     with open(reporte_memory, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== MEMORY VAD SCAN (INJECTION HUNTER): {datetime.datetime.now()} ===\n")
-        f.write("Searching for: MEM_PRIVATE + EXECUTE permission (The signature of Manual Mapping)\n\n")
+        f.write(f"=== MEMORY FORENSICS (VAD & THREADS): {datetime.datetime.now()} ===\n")
+        f.write("Scanning for: Unbacked Executable Memory & Orphan Threads (Injection Indicators)\n\n")
+
         cmd = 'tasklist /fo csv /nh'
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=0x08000000)
-        out, _ = proc.communicate()
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=0x08000000)
+            out, _ = proc.communicate()
+        except: return
+
         if not out: return
+
         for line in out.splitlines():
             if cancelar_escaneo: break
             parts = line.split(',')
             if len(parts) < 2: continue
+            
             proc_name = parts[0].strip('"')
             try: pid = int(parts[1].strip('"'))
             except: continue
+
+            # Filtro inteligente de procesos
             check_process = False
             if modo == "Analizar Todo": check_process = True
             elif any(t in proc_name.lower() for t in target_names): check_process = True
             elif any(p in proc_name.lower() for p in palabras): check_process = True
+            
             if not check_process: continue
-            h_process = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+
+            h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
             if not h_process: continue
-            f.write(f"Scanning PID {pid}: {proc_name}...\n"); f.flush()
+
+            f.write(f"--> Scanning PID {pid}: {proc_name}...\n")
+            f.flush()
+
+            # A. ESCANEO DE HILOS HUÉRFANOS (NUEVA TÉCNICA)
+            valid_modules = get_valid_ranges(pid)
+            if valid_modules:
+                h_snap_thread = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+                te32 = THREADENTRY32()
+                te32.dwSize = ctypes.sizeof(THREADENTRY32)
+                
+                orphans_found = 0
+                if kernel32.Thread32First(h_snap_thread, ctypes.byref(te32)):
+                    while True:
+                        if te32.th32OwnerProcessID == pid:
+                            h_thread = kernel32.OpenThread(THREAD_QUERY_INFORMATION, False, te32.th32ThreadID)
+                            if h_thread:
+                                start_addr = ctypes.c_void_p()
+                                # InfoClass 9 = ThreadQuerySetWin32StartAddress
+                                status = ntdll.NtQueryInformationThread(h_thread, 9, ctypes.byref(start_addr), ctypes.sizeof(start_addr), None)
+                                
+                                if status == STATUS_SUCCESS and start_addr.value:
+                                    addr_val = start_addr.value
+                                    is_valid = False
+                                    for v_start, v_end, v_name in valid_modules:
+                                        if v_start <= addr_val < v_end:
+                                            is_valid = True
+                                            break
+                                    
+                                    if not is_valid:
+                                        orphans_found += 1
+                                        f.write(f"   [!!!] ORPHAN THREAD DETECTED (TID: {te32.th32ThreadID})\n")
+                                        f.write(f"         Start Address: 0x{addr_val:X}\n")
+                                        f.write(f"         Analysis: Thread starts OUTSIDE any valid module.\n")
+                                        f.write(f"         (High Probability of Manual Map / Code Injection)\n")
+                                        f.write("-" * 40 + "\n")
+                                        f.flush()
+                                kernel32.CloseHandle(h_thread)
+                        if not kernel32.Thread32Next(h_snap_thread, ctypes.byref(te32)): break
+                kernel32.CloseHandle(h_snap_thread)
+                if orphans_found == 0:
+                    f.write("      [Threads OK] All threads act within valid modules.\n")
+
+            # B. ESCANEO VAD (MEMORIA CLÁSICA)
             address = 0
             mbi = MEMORY_BASIC_INFORMATION()
-            while ctypes.windll.kernel32.VirtualQueryEx(h_process, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            anomalies = 0
+            
+            while kernel32.VirtualQueryEx(h_process, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)):
                 if cancelar_escaneo: break
+                
+                # Buscamos memoria EJECUTABLE (X) que sea PRIVADA (No mapeada a disco)
                 is_executable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                
                 if mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE and is_executable:
                     size_kb = mbi.RegionSize / 1024
-                    if size_kb > 10: 
-                        f.write(f"   [!!!] ANOMALY DETECTED at 0x{address:X}\n")
+                    
+                    # Filtramos asignaciones muy pequeñas para reducir ruido (JIT, etc)
+                    if size_kb > 8: 
+                        anomalies += 1
+                        prot_str = "UNKNOWN"
+                        if mbi.Protect & PAGE_EXECUTE_READWRITE: prot_str = "RWX (Read/Write/Exec)"
+                        elif mbi.Protect & PAGE_EXECUTE_READ: prot_str = "RX (Read/Exec)"
+                        
+                        f.write(f"   [!!!] VAD ANOMALY at 0x{address:X}\n")
                         f.write(f"         Size: {size_kb:.2f} KB\n")
-                        f.write(f"         Type: MEM_PRIVATE (Unbacked)\n")
-                        f.write(f"         Protect: EXECUTE_READ/WRITE (Shellcode capable)\n")
-                        f.write(f"         (Probable Manual Map Injection or Unpacked Cheat)\n")
+                        f.write(f"         Protection: {prot_str}\n")
+                        f.write(f"         Type: MEM_PRIVATE (No file on disk)\n")
+                        f.write(f"         (Potential Unpacked Cheat Payload)\n")
                         f.write("-" * 40 + "\n")
                         f.flush()
+                
                 address += mbi.RegionSize
-            ctypes.windll.kernel32.CloseHandle(h_process)
+            
+            kernel32.CloseHandle(h_process)
+            f.write("\n")
 
 def fase_rogue_drivers(palabras, modo):
     if cancelar_escaneo: return
@@ -1755,7 +1942,7 @@ def fase_deep_static(*args):
     try:
         if cancelar_escaneo: return
 
-        print(f"[24/25] Deep Static Heuristics (Universal Args) [GOD-TIER]...")
+        print(f"[24/25] Deep Static Heuristics (YARA POWERED) [GOD-TIER]...")
 
         def internal_entropy_calc(data):
             if not data: return 0
@@ -1791,9 +1978,7 @@ def fase_deep_static(*args):
             ]
         except: hunt_zones = ["C:\\"]
 
-        bad_genes = [b"ReflectiveLoader", b"VirtualAllocEx", b"WriteProcessMemory", b"CreateRemoteThread", 
-                     b"Aimbot", b"Esp", b"Hook", b"Detour", b"Overlay", b"ImGui", b"XorStr", 
-                     b"Inject", b"Loader", b"Cheat", b"Bypass", b"AntiCheat"]
+        # [MODIFICADO] Lista 'bad_genes' eliminada a favor de YARA
 
         MAX_FILE_SIZE_MB = 30
         MAX_SCAN_TIME = 10
@@ -1801,8 +1986,16 @@ def fase_deep_static(*args):
 
         with open(reporte_static, "w", encoding="utf-8", buffering=1) as f:
             f.write(f"=== DEEP STATIC HEURISTICS: {datetime.datetime.now()} ===\n")
-            f.write("Mode: Universal Arguments (*args).\n\n")
+            f.write("Mode: Universal Arguments (*args) + YARA Engine.\n\n")
             
+            # Verificación de YARA
+            yara_active = False
+            if 'GLOBAL_YARA_RULES' in globals() and GLOBAL_YARA_RULES:
+                yara_active = True
+                f.write("Status: YARA Rules Loaded [ACTIVE]\n\n")
+            else:
+                f.write("Status: YARA Rules NOT Loaded [LIMITED MODE - ENTROPY ONLY]\n\n")
+
             scanned = 0
             
             for zone in hunt_zones:
@@ -1836,25 +2029,41 @@ def fase_deep_static(*args):
                                         score = 0
                                         reasons = []
 
+                                        # 1. ENTROPÍA
                                         entropy = internal_entropy_calc(data)
                                         if entropy > 7.2:
                                             score += 2
                                             reasons.append(f"HIGH ENTROPY ({entropy:.2f})")
 
-                                        hits = 0
-                                        for gene in bad_genes:
-                                            if gene in data:
-                                                hits += 1
-                                                if hits <= 3: reasons.append(f"STRING: {gene.decode()}")
+                                        # 2. [MODIFICADO] MOTOR YARA
+                                        if yara_active:
+                                            try:
+                                                matches = GLOBAL_YARA_RULES.match(data=data)
+                                                if matches:
+                                                    for match in matches:
+                                                        # Asignar peso según la severidad de la regla
+                                                        rule_name = str(match)
+                                                        if rule_name == "Inyeccion_y_Memoria":
+                                                            score += 5
+                                                            reasons.append("YARA: Critical Injection APIs")
+                                                        elif rule_name == "Cheat_Strings_Genericos":
+                                                            score += 4
+                                                            reasons.append("YARA: Cheat Keywords")
+                                                        elif rule_name == "Sus_Config_Files":
+                                                            score += 3
+                                                            reasons.append("YARA: Hack Config Pattern")
+                                                        else:
+                                                            score += 2
+                                                            reasons.append(f"YARA: {rule_name}")
+                                            except: pass
                                         
-                                        if hits > 0: score += 3
-                                        if hits > 2: score += 5
-                                        
+                                        # 3. HEURÍSTICA DE NOMBRE
                                         name_no_ext = filename.rsplit('.', 1)[0]
                                         if len(name_no_ext) < 5 and (name_no_ext.isdigit() or len(name_no_ext) <= 2):
                                             reasons.append("SHORT/NUMERIC NAME")
                                             score += 2
 
+                                        # REPORTE
                                         if score >= 4:
                                             f.write(f"[!!!] HIDDEN THREAT: {filename}\n      Path: {filepath}\n      Ind: {', '.join(reasons)}\n" + "-"*40 + "\n"); f.flush()
                                 except: pass
@@ -2229,36 +2438,25 @@ class CargaDinamicaFrame(tk.Frame):
         # Elementos graficos que necesitan centrado
         self.elements = []
         
-# Definimos la ruta segura
         archivo_logo = resource_path("Scanneler.png")
 
         try: 
             from PIL import Image, ImageTk
-            
-            # Cargar imagen
             self.pir = Image.open(archivo_logo)
-            # La hacemos un poco más chica para el logo (250x250)
             self.pir = self.pir.resize((300, 250), Image.Resampling.LANCZOS)
             self.il = ImageTk.PhotoImage(self.pir)
-            
-            # Ponemos la imagen en el centro (450, 300 son coordenadas aprox)
             self.logo_id = self.canvas.create_image(450, 300, image=self.il)
-            
-            # USAMOS LA FUNCIÓN CORRECTA PARA ESTA PANTALLA
             self.canvas.bind("<Configure>", self.center_content) 
-
         except Exception as e: 
-            # Si falla, mostramos el error para debug
-            from tkinter import messagebox
-            messagebox.showerror("Error", f"Detalle: {e}")
             self.logo_id = self.canvas.create_text(450, 300, text="[ SCANNELER ]", fill="#d500f9", font=("Consolas", 30, "bold"))
             
         # Texto de estado debajo
         self.text_id = self.canvas.create_text(550, 450, text="INICIANDO SISTEMA...", fill="#d500f9", font=("Consolas", 14, "bold"))
         
-        # Bind para recentrar
         self.canvas.bind("<Configure>", self.center_content)
-        self.after(3000, self.go_login)
+        
+        # --- CAMBIO AQUÍ: En lugar de esperar 3 segundos vacíos, iniciamos la carga real ---
+        self.after(500, self.iniciar_carga)
 
     def center_content(self, event):
         w, h = event.width, event.height
@@ -2268,6 +2466,21 @@ class CargaDinamicaFrame(tk.Frame):
 
     def cleanup(self):
         if hasattr(self, 'anim'): self.anim.detener()
+
+    def iniciar_carga(self):
+        # 1. Actualizamos texto visualmente
+        self.canvas.itemconfig(self.text_id, text="CARGANDO MOTOR YARA...")
+        self.update_idletasks() # Fuerza a la ventana a repintar el texto
+        
+        # 2. Cargamos YARA (Llama a la función global que creamos antes)
+        inicializar_yara()
+        
+        # 3. Finalizamos
+        self.canvas.itemconfig(self.text_id, text="SISTEMA LISTO.")
+        self.update_idletasks()
+        
+        # 4. Pequeña pausa para que el usuario lea "LISTO" y cambio de pantalla
+        self.after(1000, self.go_login)
 
     def go_login(self):
         self.controller.switch_frame(LoginFrame)
@@ -2751,6 +2964,11 @@ class ScannerFrame(tk.Frame):
 if __name__ == "__main__":
     if check_security():
         sys.exit()
+    
+    # --- INICIALIZAR YARA AQUÍ ---
+    print("Cargando motor de detección...")
+    inicializar_yara() 
+    # -----------------------------
     
     app = ScannelerApp()
     app.mainloop()
