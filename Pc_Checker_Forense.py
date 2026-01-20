@@ -423,7 +423,9 @@ def ask_yes_no(title, msg): alert = ModernAlert(title, msg, "ask"); return alert
 def worker_virustotal():
     while not cancelar_escaneo:
         ruta = cola_vt.get()
-        if ruta is None: break
+        if ruta is None: 
+            cola_vt.task_done() # <--- ¡ESTO ES OBLIGATORIO!
+            break
         try:
             with open(ruta, "rb") as f: file_hash = hashlib.sha256(f.read()).hexdigest()
             headers = {"x-apikey": VT_API_KEY}; url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
@@ -2337,6 +2339,8 @@ def fase_string_cleaning(palabras, modo):
                         if "kprocesshacker" in svc: tag = "[!!!] KPROCESS HACKER SERVICE"
                         f.write(f"{tag} Service found: {svc}\n")
         except: pass           
+        
+
                  
 # --- HTML REPORT ---
 def generar_reporte_html(out_f, cfg):
@@ -2886,14 +2890,17 @@ class ScannerFrame(tk.Frame):
         self.canvas = tk.Canvas(self, bg=COLOR_BG, highlightthickness=0); self.canvas.pack(fill="both", expand=True)
         self.anim = CyberRain(self.canvas, COLOR_ACCENT)
         self.content = tk.Frame(self.canvas, bg=COLOR_BG)
-        self.wid = self.canvas.create_window(450, 300, window=self.content, anchor="center") # Anchor center
-        self.canvas.bind("<Configure>", lambda e: self.canvas.coords(self.wid, e.width/2, e.height/2)) # Auto-center on resize
+        self.wid = self.canvas.create_window(450, 300, window=self.content, anchor="center") 
+        self.canvas.bind("<Configure>", lambda e: self.canvas.coords(self.wid, e.width/2, e.height/2))
 
         tk.Label(self.content, text=t("audit_prog"), font=("Consolas", 18, "bold"), bg=COLOR_BG, fg=COLOR_ACCENT).pack(pady=40)
         self.l_status = tk.Label(self.content, text=t("init"), font=("Consolas", 12), bg=COLOR_BG, fg=COLOR_TEXT); self.l_status.pack(pady=30)
         BotonDinamico(self.content, COLOR_DANGER, text=t("stop_scan"), command=self.stop, width=25).pack()
         
-        self.scan_thread = threading.Thread(target=self.run_scan, daemon=True); self.scan_thread.start()
+        # Iniciar el hilo de escaneo
+        self.scan_thread = threading.Thread(target=self.run_scan, daemon=True)
+        self.scan_thread.start()
+        
         self.check_queue()
 
     def cleanup(self):
@@ -2921,19 +2928,67 @@ class ScannerFrame(tk.Frame):
         self.controller.switch_frame(MenuFrame)
 
     def run_scan(self):
-        global reporte_shim, reporte_appcompat, reporte_sospechosos, reporte_firmas, reporte_path, reporte_ocultos, reporte_mft, reporte_vt, reporte_userassist, reporte_usb, reporte_dns, reporte_browser, reporte_persistencia, reporte_eventos, reporte_process, reporte_game, reporte_nuclear, reporte_kernel, reporte_dna, reporte_network, reporte_toxic, reporte_ghost, reporte_memory, reporte_drivers, reporte_static, reporte_morph
+        # Declarar todas las variables globales de reporte
+        global reporte_shim, reporte_appcompat, reporte_sospechosos, reporte_firmas, reporte_path
+        global reporte_ocultos, reporte_mft, reporte_vt, reporte_userassist, reporte_usb
+        global reporte_dns, reporte_browser, reporte_persistencia, reporte_eventos
+        global reporte_process, reporte_game, reporte_nuclear, reporte_kernel, reporte_dna
+        global reporte_network, reporte_toxic, reporte_ghost, reporte_memory, reporte_drivers
+        global reporte_static, reporte_morph, reporte_cleaning
+
         bd, fn = self.rutas.get('path', os.path.abspath(".")), self.rutas.get('folder', "Resultados_SS")
         fp = os.path.join(bd, fn)
         if not os.path.exists(fp): os.makedirs(fp, exist_ok=True)
-        reporte_shim = os.path.join(fp, "Shimcache_Rastros.txt"); reporte_appcompat = os.path.join(fp, "rastro_appcompat.txt"); reporte_path = os.path.join(fp, "buscar_en_disco.txt"); reporte_sospechosos = os.path.join(fp, "cambios_sospechosos.txt"); reporte_firmas = os.path.join(fp, "Digital_Signatures_ZeroTrust.txt"); reporte_ocultos = os.path.join(fp, "archivos_ocultos.txt"); reporte_mft = os.path.join(fp, "MFT_Archivos.txt"); reporte_vt = os.path.join(fp, "detecciones_virustotal.txt"); reporte_userassist = os.path.join(fp, "UserAssist_Decoded.txt"); reporte_usb = os.path.join(fp, "USB_History.txt"); reporte_dns = os.path.join(fp, "DNS_Cache.txt"); reporte_browser = os.path.join(fp, "Browser_Forensics.txt"); reporte_persistencia = os.path.join(fp, "Persistence_Check.txt"); reporte_eventos = os.path.join(fp, "Windows_Events.txt"); reporte_process = os.path.join(fp, "Process_Hunter.txt"); reporte_game = os.path.join(fp, "Game_Cheat_Hunter.txt"); reporte_nuclear = os.path.join(fp, "Nuclear_Traces.txt"); reporte_kernel = os.path.join(fp, "Kernel_Anomalies.txt"); reporte_dna = os.path.join(fp, "DNA_Prefetch.txt"); reporte_network = os.path.join(fp, "Network_Anomalies.txt"); reporte_toxic = os.path.join(fp, "Toxic_LNK.txt"); reporte_ghost = os.path.join(fp, "Ghost_Trails.txt"); reporte_memory = os.path.join(fp, "Memory_Injection_Report.txt"); reporte_drivers = os.path.join(fp, "Rogue_Drivers.txt"); reporte_static = os.path.join(fp, "Deep_Static_Analysis.txt"); reporte_morph = os.path.join(fp, "Metamorphosis_Report.txt");
+        
+        # Asignar rutas
+        reporte_shim = os.path.join(fp, "Shimcache_Rastros.txt")
+        reporte_appcompat = os.path.join(fp, "rastro_appcompat.txt")
+        reporte_path = os.path.join(fp, "buscar_en_disco.txt")
+        reporte_sospechosos = os.path.join(fp, "cambios_sospechosos.txt")
+        reporte_firmas = os.path.join(fp, "Digital_Signatures_ZeroTrust.txt")
+        reporte_ocultos = os.path.join(fp, "archivos_ocultos.txt")
+        reporte_mft = os.path.join(fp, "MFT_Archivos.txt")
+        reporte_vt = os.path.join(fp, "detecciones_virustotal.txt")
+        reporte_userassist = os.path.join(fp, "UserAssist_Decoded.txt")
+        reporte_usb = os.path.join(fp, "USB_History.txt")
+        reporte_dns = os.path.join(fp, "DNS_Cache.txt")
+        reporte_browser = os.path.join(fp, "Browser_Forensics.txt")
+        reporte_persistencia = os.path.join(fp, "Persistence_Check.txt")
+        reporte_eventos = os.path.join(fp, "Windows_Events.txt")
+        reporte_process = os.path.join(fp, "Process_Hunter.txt")
+        reporte_game = os.path.join(fp, "Game_Cheat_Hunter.txt")
+        reporte_nuclear = os.path.join(fp, "Nuclear_Traces.txt")
+        reporte_kernel = os.path.join(fp, "Kernel_Anomalies.txt")
+        reporte_dna = os.path.join(fp, "DNA_Prefetch.txt")
+        reporte_network = os.path.join(fp, "Network_Anomalies.txt")
+        reporte_toxic = os.path.join(fp, "Toxic_LNK.txt")
+        reporte_ghost = os.path.join(fp, "Ghost_Trails.txt")
+        reporte_memory = os.path.join(fp, "Memory_Injection_Report.txt")
+        reporte_drivers = os.path.join(fp, "Rogue_Drivers.txt")
+        reporte_static = os.path.join(fp, "Deep_Static_Analysis.txt")
+        reporte_morph = os.path.join(fp, "Metamorphosis_Report.txt")
+        reporte_cleaning = os.path.join(fp, "String_Cleaner_Detection.txt")
+
         try: generar_reporte_html(fp, self.config)
         except: pass
+        
+        # Verificar si VirusTotal está activo (Variable vte)
         vte = self.config.get('vt', {}).get('active', False)
         if vte: 
             with open(reporte_vt, "w", encoding="utf-8") as f: f.write(f"=== VT: {datetime.datetime.now()} ===\n\n")
             threading.Thread(target=worker_virustotal, daemon=True).start()
         
-        fases = [('f1', fase_shimcache), ('f2', fase_rastro_appcompat), ('f3', fase_nombre_original), ('f4', fase_verificar_firmas), ('f5', fase_buscar_en_disco), ('f6', fase_archivos_ocultos), ('f7', fase_mft_ads), ('f8', fase_userassist), ('f9', fase_usb_history), ('f10', fase_dns_cache), ('f11', fase_browser_forensics), ('f12', fase_persistence), ('f13', fase_event_logs), ('f14', fase_process_hunter), ('f15', fase_game_cheat_hunter), ('f16', fase_nuclear_traces), ('f17', fase_kernel_hunter), ('f18', fase_dna_prefetch), ('f19', fase_network_hunter), ('f20', fase_toxic_lnk), ('f21', fase_ghost_trails), ('f22', fase_memory_anomaly), ('f23', fase_rogue_drivers), ('f24', fase_deep_static), ('f25', fase_metamorphosis_hunter), ('f26', fase_string_cleaning)]
+        fases = [
+            ('f1', fase_shimcache), ('f2', fase_rastro_appcompat), ('f3', fase_nombre_original),
+            ('f4', fase_verificar_firmas), ('f5', fase_buscar_en_disco), ('f6', fase_archivos_ocultos),
+            ('f7', fase_mft_ads), ('f8', fase_userassist), ('f9', fase_usb_history),
+            ('f10', fase_dns_cache), ('f11', fase_browser_forensics), ('f12', fase_persistence),
+            ('f13', fase_event_logs), ('f14', fase_process_hunter), ('f15', fase_game_cheat_hunter),
+            ('f16', fase_nuclear_traces), ('f17', fase_kernel_hunter), ('f18', fase_dna_prefetch),
+            ('f19', fase_network_hunter), ('f20', fase_toxic_lnk), ('f21', fase_ghost_trails),
+            ('f22', fase_memory_anomaly), ('f23', fase_rogue_drivers), ('f24', fase_deep_static),
+            ('f25', fase_metamorphosis_hunter), ('f26', fase_string_cleaning)
+        ]
         
         for k, func in fases:
             if cancelar_escaneo: break
@@ -2945,21 +3000,30 @@ class ScannerFrame(tk.Frame):
                 if k == 'f3': args = [vte, self.palabras, self.config[k]['modo']]
                 elif k == 'f4': args = [self.palabras, vte, self.config[k]['modo']]
                 elif k == 'f5': args = [self.palabras]
-                elif k == 'f24': args = [self.palabras, self.config[k]['modo']] # F24 usa *args asi que esto funciona
-                elif k == 'f25': args = [self.palabras, self.config[k]['modo']] # F25 tambien
+                elif k == 'f24': args = [self.palabras, self.config[k]['modo']]
+                elif k == 'f25': args = [self.palabras, self.config[k]['modo']]
                 else: args = [self.palabras, self.config[k]['modo']]
                 
                 try: func(*args)
                 except Exception as e: 
-                    print(f"Error executing {k}: {e}") # Debug en consola
+                    print(f"Error executing {k}: {e}") 
                 
-                # Actualizar HTML despues de cada fase para "Tiempo Real" visual
                 try: generar_reporte_html(fp, self.config)
                 except: pass
-                
+        
+        # --- FINALIZACIÓN CORRECTA CON VIRUSTOTAL ---
+        # 1. Enviar señal de fin a la cola
         cola_vt.put(None)
+        
+        # 2. Esperar a VT solo si estaba activo (usando variable vte)
+        if vte:
+            self.update_status("Finalizando subidas a VirusTotal...")
+            # IMPORTANTE: Asegúrate de que worker_virustotal tenga cola_vt.task_done()
+            cola_vt.join()
+
         if not cancelar_escaneo: 
-            self.fp_final = fp; self.cola_estado.put("DONE_SIGNAL")
+            self.fp_final = fp
+            self.cola_estado.put("DONE_SIGNAL")
 
 if __name__ == "__main__":
     if check_security():
