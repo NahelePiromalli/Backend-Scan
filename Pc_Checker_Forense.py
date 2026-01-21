@@ -22,6 +22,8 @@ import re
 import math
 from collections import Counter
 import yara
+import datetime
+from datetime import timedelta
 
 # --- FUNCIÓN PARA RUTAS RELATIVAS (NECESARIA PARA NUITKA) ---
 def resource_path(relative_path):
@@ -877,9 +879,41 @@ def fase_mft_ads(palabras, modo):
             except: pass
 
 def fase_userassist(palabras, modo):
-    if cancelar_escaneo: return
+    # if cancelar_escaneo: return
+    print("[28/28] UserAssist (Human Interaction + Timestamps)...")
+    
+    global reporte_userassist
+    # Ajusta rutas según tu código global
+    try:
+        base_path = HISTORIAL_RUTAS.get('path', os.path.abspath("."))
+        folder_name = HISTORIAL_RUTAS.get('folder', "Resultados_SS")
+    except:
+        base_path = os.path.abspath(".")
+        folder_name = "Resultados_SS"
+        
+    reporte_userassist = os.path.join(base_path, folder_name, "User_Interaction_Trace.txt")
+
+    # Helper interno para convertir fecha de Windows
+    def get_date(binary_data):
+        try:
+            # En Win10/11 el timestamp suele estar en el offset 60
+            if len(binary_data) >= 68:
+                ft = struct.unpack('<Q', binary_data[60:68])[0]
+                if ft == 0: return "Unknown"
+                us = ft / 10
+                dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=us)
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+        except: pass
+        return "Unknown Time"
+
+    # Filtro de tiempo: ¿Quieres ver cosas de hace 1 año? No. 
+    # Solo mostramos cosas ejecutadas en las ultimas 48 horas para la SS.
+    limit_date = datetime.datetime.now() - datetime.timedelta(hours=48)
+
     with open(reporte_userassist, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== USERASSIST: {datetime.datetime.now()} ===\n\n")
+        f.write(f"=== USERASSIST (INTERACTION PROOF): {datetime.datetime.now()} ===\n")
+        f.write("Muestra archivos que el usuario abrió MANUALMENTE (doble clic) recientemente.\n\n")
+        
         try:
             r = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r) as k_ua:
@@ -890,10 +924,32 @@ def fase_userassist(palabras, modo):
                         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{r}\\{guid}\\Count") as k_c:
                             num_values = winreg.QueryInfoKey(k_c)[1]
                             for j in range(num_values):
-                                n_rot, _, _ = winreg.EnumValue(k_c, j)
+                                # AQUI EL CAMBIO: Leemos 'data' tambien, no solo el nombre
+                                n_rot, data, type_ = winreg.EnumValue(k_c, j)
                                 try:
                                     n_real = codecs.decode(n_rot, 'rot_13')
-                                    if modo == "Analizar Todo" or any(p in n_real.lower() for p in palabras): f.write(f"EJECUTADO: {n_real}\n"); f.flush()
+                                    timestamp_str = get_date(data)
+                                    
+                                    # Lógica de detección
+                                    found = False
+                                    
+                                    # 1. Si encontramos palabra clave
+                                    if any(p in n_real.lower() for p in palabras):
+                                        found = True
+                                    
+                                    # 2. Si analizamos todo, filtramos por FECHA RECIENTE (Letal)
+                                    elif modo == "Analizar Todo":
+                                        # Si la fecha es válida y es reciente (ultimas 48hs)
+                                        if timestamp_str != "Unknown Time" and timestamp_str != "Unknown":
+                                            dt_obj = datetime.datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                                            if dt_obj > limit_date:
+                                                found = True
+
+                                    if found:
+                                        # Escribimos con la FECHA. Esto es lo que cierra el caso.
+                                        f.write(f"[{timestamp_str}] CLICKED: {n_real}\n")
+                                        f.flush()
+
                                 except: continue
                     except: continue
         except: pass
@@ -1056,20 +1112,83 @@ def fase_usb_history(palabras, modo):
                 f.write("[OK] No active network drives mapped.\n")
         except: pass
 
+import os
+import subprocess
+import datetime
+import re
+import time
+
 def fase_dns_cache(palabras, modo):
     if cancelar_escaneo: return
+
+    # --- PASO 1: MATAR DISCORD ---
+    try:
+        subprocess.run("taskkill /IM discord.exe /F", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+    except:
+        pass 
+
+    discord_path = os.path.join(os.getenv('APPDATA'), 'discord', 'Local Storage', 'leveldb')
+    url_pattern = re.compile(rb'https?://(?:cdn|media)\.discordapp\.(?:com|net)/attachments/[\w\d_\-\./]+')
+
     with open(reporte_dns, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== DNS CACHE: {datetime.datetime.now()} ===\n\n")
+        f.write(f"=== REPORTE DE RED Y ORIGEN (DNS + DISCORD): {datetime.datetime.now()} ===\n")
+        
+        # --- SECCIÓN DNS ---
+        f.write(f"\n[+] SECCIÓN DNS CACHE (Dominios Visitados)\n")
+        f.write("="*60 + "\n")
         try:
             out = subprocess.check_output("ipconfig /displaydns", shell=True, text=True, errors='ignore')
+            dns_encontrados = False
             for l in out.splitlines():
                 l = l.strip()
                 if "Nombre de registro" in l or "Record Name" in l:
                     parts = l.split(":")
                     if len(parts) > 1:
                         dom = parts[1].strip()
-                        if dom and (modo == "Analizar Todo" or any(p in dom.lower() for p in palabras)): f.write(f"DOMAIN: {dom}\n"); f.flush()
-        except: pass
+                        if dom and (modo == "Analizar Todo" or any(p in dom.lower() for p in palabras)):
+                            f.write(f"  > DNS ENTRY: {dom}\n")
+                            dns_encontrados = True
+            if not dns_encontrados: f.write("  (Sin datos relevantes)\n")
+        except Exception as e:
+            f.write(f"  [ERROR] DNS: {str(e)}\n")
+
+        # --- SECCIÓN DISCORD ---
+        f.write(f"\n\n[+] SECCIÓN DISCORD DOWNLOADS (Rastreo de Links)\n")
+        f.write("="*60 + "\n")
+        
+        if os.path.exists(discord_path):
+            links_encontrados = 0
+            # CORRECCIÓN AQUÍ: Quitamos el 'try' externo innecesario o le añadimos except.
+            # Lo mejor es manejar el error dentro del loop o usar un try global con su except.
+            try: 
+                for filename in os.listdir(discord_path):
+                    if filename.endswith(".ldb") or filename.endswith(".log"):
+                        full_path = os.path.join(discord_path, filename)
+                        try:
+                            with open(full_path, "rb") as db_file:
+                                content = db_file.read()
+                                matches = url_pattern.findall(content)
+                                for url_bytes in matches:
+                                    url_str = url_bytes.decode('utf-8', errors='ignore')
+                                    es_sospechoso = False
+                                    if any(ext in url_str.lower() for ext in ['.exe', '.dll', '.rar', '.zip', '.7z']): es_sospechoso = True
+                                    elif modo != "Analizar Todo" and any(p in url_str.lower() for p in palabras): es_sospechoso = True
+                                    elif modo == "Analizar Todo": es_sospechoso = True
+
+                                    if es_sospechoso:
+                                        f.write(f"  > LINK RECUPERADO: {url_str}\n")
+                                        links_encontrados += 1
+                        except: continue 
+            except Exception as e:
+                f.write(f"  [ERROR] Al leer carpeta Discord: {str(e)}\n") # <--- ESTE EXCEPT FALTABA
+
+            if links_encontrados == 0:
+                f.write(f"  (No se encontraron enlaces sospechosos)\n")
+        else:
+            f.write("  [INFO] No se encontró carpeta de Discord.\n")
+
+        f.flush()
 
 def fase_browser_forensics(palabras, modo):
     if cancelar_escaneo: return
@@ -1214,35 +1333,158 @@ def fase_event_logs(palabras, modo):
 
 def fase_process_hunter(palabras, modo):
     if cancelar_escaneo: return
-    sys_bins = {"svchost.exe": "c:\\windows\\system32", "csrss.exe": "c:\\windows\\system32", "winlogon.exe": "c:\\windows\\system32", "services.exe": "c:\\windows\\system32", "lsass.exe": "c:\\windows\\system32", "smss.exe": "c:\\windows\\system32", "explorer.exe": "c:\\windows", "taskmgr.exe": "c:\\windows\\system32", "conhost.exe": "c:\\windows\\system32"}
+    print(f"[14/24] Process Genealogy Hunter (Parent-Child Analysis) [LETHAL]...")
+    
+    # --- ESTRUCTURAS NATIVAS ---
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                    ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_ulong),
+                    ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                    ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_char * 260)]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    
+    # --- REGLAS DE GENEALOGÍA (La trampa para cheats) ---
+    # Hijo: [Padres Permitidos]
+    GENEALOGY_RULES = {
+        "svchost.exe": ["services.exe"],
+        "lsass.exe": ["wininit.exe"],
+        "services.exe": ["wininit.exe"],
+        "lsm.exe": ["wininit.exe"],
+        "csrss.exe": ["smss.exe"], # A veces creado por System, pero smss es el standard user-mode
+        "wininit.exe": ["smss.exe"],
+        "winlogon.exe": ["smss.exe"],
+        "spoolsv.exe": ["services.exe"],
+        "taskhostw.exe": ["svchost.exe", "explorer.exe", "services.exe"],
+        "sihost.exe": ["svchost.exe"],
+        "fontdrvhost.exe": ["wininit.exe", "winlogon.exe"],
+        "dwm.exe": ["winlogon.exe"]
+    }
+    
+    # Rutas legítimas esperadas
+    LEGIT_PATHS = {
+        "svchost.exe": r"c:\windows\system32",
+        "lsass.exe": r"c:\windows\system32",
+        "csrss.exe": r"c:\windows\system32",
+        "wininit.exe": r"c:\windows\system32",
+        "services.exe": r"c:\windows\system32",
+        "winlogon.exe": r"c:\windows\system32",
+        "explorer.exe": r"c:\windows",
+        "conhost.exe": r"c:\windows\system32"
+    }
+
     with open(reporte_process, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== PROCESS HUNTER: {datetime.datetime.now()} ===\n\n"); f.write("--- LIVE RAM ANALYSIS ---\n")
-        try:
-            proc = subprocess.Popen('wmic process get ProcessId,Name,ExecutablePath /format:csv', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, creationflags=0x08000000); out, _ = proc.communicate()
-            if out:
-                lines = out.splitlines()
-                for l in lines:
-                    if not l.strip(): continue
-                    parts = l.split(","); 
-                    if len(parts) < 2: continue
-                    try: path = parts[1].strip(); name = parts[2].strip(); pid = parts[3].strip()
-                    except: continue
-                    if name.lower() == "name": continue 
-                    susp = False; reason = ""
-                    if name.lower() in sys_bins:
-                        expected = sys_bins[name.lower()]
-                        if path and not path.lower().startswith(expected): susp = True; reason = f"MASQUERADING: Se espera en {expected} pero corre en {path}"
-                    if path and ("\\temp\\" in path.lower() or "\\appdata\\" in path.lower()):
-                        if modo == "Analizar Todo":
-                             if not susp: pass 
-                    info = f"PID: {pid} | NAME: {name} | PATH: {path}"
-                    if susp: f.write(f"[!!!] CRITICAL: {name} (PID {pid})\n      > {reason}\n"); f.flush()
-                    elif modo=="Analizar Todo" or any(p in info.lower() for p in palabras): f.write(f"[LIVE] {info}\n"); f.flush()
-        except Exception as e: f.write(f"Error reading processes: {e}\n")
+        f.write(f"=== PROCESS GENEALOGY & MASQUERADE HUNTER: {datetime.datetime.now()} ===\n")
+        f.write("Strategy: Native Snapshot + Parent/Child Validation + Path Check\n\n")
+        f.write("--- LIVE PROCESS ANALYSIS ---\n")
+
+        # 1. TOMAR FOTO DEL SISTEMA (SNAPSHOT)
+        h_snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        pe32 = PROCESSENTRY32()
+        pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
+
+        if h_snap == -1:
+            f.write("[ERROR] Could not take process snapshot.\n")
+            return
+
+        # 2. MAPEAR TODOS LOS PROCESOS (PID -> Info)
+        proc_map = {}
+        if ctypes.windll.kernel32.Process32First(h_snap, ctypes.byref(pe32)):
+            while True:
+                pid = pe32.th32ProcessID
+                ppid = pe32.th32ParentProcessID
+                name = pe32.szExeFile.decode('cp1252', 'ignore').lower()
+                proc_map[pid] = {"name": name, "ppid": ppid, "path": "Unknown"}
+                if not ctypes.windll.kernel32.Process32Next(h_snap, ctypes.byref(pe32)): break
+        ctypes.windll.kernel32.CloseHandle(h_snap)
+
+        # 3. ANALIZAR CADA PROCESO
+        buffer = ctypes.create_unicode_buffer(1024)
+        count_susp = 0
+        
+        for pid, info in proc_map.items():
+            if cancelar_escaneo: break
+            name = info["name"]
+            ppid = info["ppid"]
+            
+            # Obtener Ruta Real (Requiere abrir proceso)
+            # Usamos QUERY_LIMITED_INFORMATION para saltar protecciones de admin
+            h_proc = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            real_path = ""
+            if h_proc:
+                size = ctypes.c_ulong(1024)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(h_proc, 0, buffer, ctypes.byref(size)):
+                    real_path = buffer.value.lower()
+                    info["path"] = real_path # Guardamos para uso futuro
+                ctypes.windll.kernel32.CloseHandle(h_proc)
+
+            # --- DETECCIONES ---
+            is_suspicious = False
+            reasons = []
+
+            # A. DETECCIÓN DE CAMUFLAJE DE RUTA (Masquerading)
+            if name in LEGIT_PATHS:
+                expected_dir = LEGIT_PATHS[name]
+                if real_path and not real_path.startswith(expected_dir):
+                    is_suspicious = True
+                    reasons.append(f"FAKE PATH: Running from {real_path} (Expected: {expected_dir})")
+
+            # B. DETECCIÓN DE PADRE FALSO (Genealogy Mismatch)
+            if name in GENEALOGY_RULES:
+                parent_info = proc_map.get(ppid)
+                if parent_info:
+                    parent_name = parent_info["name"]
+                    allowed_parents = GENEALOGY_RULES[name]
+                    if parent_name not in allowed_parents:
+                        is_suspicious = True
+                        reasons.append(f"BAD PARENT: Spawmed by '{parent_name}' (PID {ppid}). Expected: {allowed_parents}")
+                else:
+                    # El padre murió o no existe (Hérfano). 
+                    # Para servicios críticos esto es raro, pero pasa. No lo marcamos rojo directo, pero es nota.
+                    pass
+
+            # C. DETECCIÓN DE RUTA TEMPORAL (Lazy Cheats)
+            if real_path and ("\\temp\\" in real_path or "\\appdata\\" in real_path or "\\downloads\\" in real_path):
+                if name.endswith(".exe"):
+                    # Solo marcamos si parece un cheat o modo paranoico
+                    if any(k in name for k in ["loader", "client", "cheat", "inject"]):
+                         is_suspicious = True
+                         reasons.append("Running from TEMP/APPDATA with suspicious name")
+                    elif modo == "Analizar Todo":
+                         reasons.append("Running from TEMP/APPDATA")
+                         # Nota: No marcamos is_suspicious a True solo por esto para no llenar de falsos positivos en Discord/Updates,
+                         # pero lo reportamos abajo.
+
+            # D. KEYWORD MATCH
+            if any(p in name for p in palabras) or any(p in real_path for p in palabras):
+                is_suspicious = True
+                reasons.append("Keyword Match")
+
+            # --- REPORTE ---
+            if is_suspicious:
+                count_susp += 1
+                f.write(f"[!!!] PROCESS ANOMALY: {name} (PID {pid})\n")
+                f.write(f"      Path: {real_path}\n")
+                f.write(f"      Parent PID: {ppid} ({proc_map.get(ppid, {}).get('name', 'Unknown')})\n")
+                f.write(f"      Detection: {', '.join(reasons)}\n")
+                f.write("-" * 50 + "\n")
+                f.flush()
+                
+            elif modo == "Analizar Todo" and real_path:
+                # Log limpio
+                f.write(f"[LIVE] {name} (PID {pid}) -> {real_path}\n")
+
+        if count_susp == 0:
+            f.write("[OK] No process genealogy anomalies found.\n")
+
+        # 4. PROCESOS MUERTOS (EVENT LOGS) - Mantenemos esto porque es útil
         f.write("\n--- DEAD PROCESSES (Last 45 mins) ---\n")
         try:
             ps = "Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4689} -ErrorAction SilentlyContinue | Where-Object {$_.TimeCreated -ge (Get-Date).AddMinutes(-45)} | Select-Object @{N='Time';E={$_.TimeCreated.ToString('HH:mm:ss')}}, @{N='Name';E={$_.Properties[0].Value}} | Format-Table -HideTableHeaders"
-            proc = subprocess.Popen(f'powershell -NoProfile -Command "{ps}"', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, encoding='cp850', errors='ignore', creationflags=0x08000000); out, _ = proc.communicate()
+            proc = subprocess.Popen(f'powershell -NoProfile -Command "{ps}"', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, encoding='cp850', errors='ignore', creationflags=0x08000000)
+            out, _ = proc.communicate()
             if out:
                 unique_procs = set()
                 for l in out.splitlines():
@@ -1254,128 +1496,263 @@ def fase_process_hunter(palabras, modo):
 
 def fase_game_cheat_hunter(palabras, modo):
     if cancelar_escaneo: return
-    print(f"[15/24] Game Cheat Hunter (YARA POWERED) [ULTRA DEEP SCAN]...")
+    print(f"[15/24] Game Cheat Hunter (YARA + UNLIMITED FILES) [LETHAL]...")
     
     # Lista negra interna para nombres de archivos (Metadata)
     internal_blackilst = ["cheat engine", "process hacker", "x64dbg", "ollydbg", "dnspy", "injector", "ks dumper", "http debugger", "netlimiter"]
 
+    # Extensiones a escanear
+    target_exts = ('.exe', '.dll', '.tmp', '.sys', '.bin', '.dat', '.vmp', '.mem')
+
     with open(reporte_game, "w", encoding="utf-8", buffering=1) as f:
         f.write(f"=== GAME CHEAT HUNTER (YARA): {datetime.datetime.now()} ===\n")
+        f.write("Strategy: Size-Filtered (<45MB) but Quantity-Unlimited (Anti-Timestomp).\n")
         
         if GLOBAL_YARA_RULES is None:
-             f.write("[ERROR] YARA Rules not loaded. Skipping deep content scan.\n\n")
+             f.write("[ERROR] YARA Rules not loaded. Scanning entropy/metadata only.\n\n")
         else:
              f.write(f"Engine: YARA Active | Rules Loaded.\n\n")
 
-        hot_paths = [os.path.join(os.environ["USERPROFILE"], "Downloads"), 
-                     os.path.join(os.environ["USERPROFILE"], "Desktop"), 
-                     os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Temp"),
-                     os.path.join(os.environ["USERPROFILE"], "AppData", "Roaming")]
+        hot_paths = [
+            os.path.join(os.environ["USERPROFILE"], "Downloads"), 
+            os.path.join(os.environ["USERPROFILE"], "Desktop"), 
+            os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Temp"),
+            os.path.join(os.environ["USERPROFILE"], "AppData", "Roaming")
+        ]
+        
+        # Soporte para carpetas de OneDrive
+        onedrive = os.path.join(os.environ["USERPROFILE"], "OneDrive")
+        if os.path.exists(onedrive):
+            hot_paths.append(os.path.join(onedrive, "Desktop"))
+            hot_paths.append(os.path.join(onedrive, "Downloads"))
+
+        total_scanned = 0
+        detections = 0
 
         for target_dir in hot_paths:
             if not os.path.exists(target_dir): continue
-            f.write(f"--- Scanning: {target_dir} ---\n")
+            f.write(f"--- Scanning Directory: {target_dir} ---\n")
             
             try:
-                # Escaneamos los 80 archivos más recientes
+                # Usamos os.scandir para velocidad máxima
                 with os.scandir(target_dir) as entries:
-                    files = sorted([e.path for e in entries if e.is_file() and e.name.lower().endswith(('.exe', '.dll', '.tmp', '.sys', '.bin', '.dat'))], key=os.path.getmtime, reverse=True)[:80]
-                
-                for file_path in files:
-                    if cancelar_escaneo: break
-                    file_name = os.path.basename(file_path)
-                    suspicious = False
-                    reason = ""
-                    entropy_val = 0
-                    
-                    try:
-                        # 1. Lectura y Entropía
-                        with open(file_path, "rb") as bf:
-                            content = bf.read(15 * 1024 * 1024) # Leer primeros 15MB
+                    for entry in entries:
+                        if cancelar_escaneo: break
+                        
+                        try:
+                            # 1. Filtro rápido de extensión
+                            if not entry.is_file() or not entry.name.lower().endswith(target_exts):
+                                continue
+
+                            # 2. FILTRO DE TAMAÑO (La clave de la velocidad)
+                            # Ignoramos archivos > 40MB (Los cheats raramente pesan tanto)
+                            size = entry.stat().st_size
+                            if size > 40 * 1024 * 1024: 
+                                continue
+
+                            total_scanned += 1
+                            file_path = entry.path
+                            file_name = entry.name
+                            suspicious = False
+                            reason = ""
+                            entropy_val = 0
                             
-                        entropy_val = calculate_entropy(content)
-                        if entropy_val > 7.4: 
-                            suspicious = True
-                            reason = f"HIGH ENTROPY ({entropy_val:.2f}): Possible Packed/Encrypted Hack"
+                            # 3. Lectura de contenido
+                            with open(file_path, "rb") as bf:
+                                content = bf.read(15 * 1024 * 1024) # Leer primeros 15MB
+                            
+                            # A. Análisis de Entropía
+                            entropy_val = calculate_entropy(content)
+                            if entropy_val > 7.4: 
+                                suspicious = True
+                                reason = f"HIGH ENTROPY ({entropy_val:.2f}): Possible Packed/Encrypted Hack"
 
-                        # 2. ESCANEO CON YARA (Reemplaza el bucle for gigante anterior)
-                        if GLOBAL_YARA_RULES:
-                            try:
-                                # Escaneamos el contenido en memoria
-                                matches = GLOBAL_YARA_RULES.match(data=content)
-                                if matches:
-                                    suspicious = True
-                                    reglas_activadas = [m.rule for m in matches]
-                                    # Obtener detalles de qué strings detectó (opcional)
-                                    reason = f"YARA MATCH: {', '.join(reglas_activadas)}"
-                            except Exception as yara_e:
-                                print(f"Yara error on {file_name}: {yara_e}")
+                            # B. ESCANEO CON YARA
+                            if GLOBAL_YARA_RULES:
+                                try:
+                                    matches = GLOBAL_YARA_RULES.match(data=content)
+                                    if matches:
+                                        suspicious = True
+                                        # --- VARIABLE CORREGIDA AQUÍ ---
+                                        reglas_scanneler = [m.rule for m in matches]
+                                        reason = f"YARA MATCH: {', '.join(reglas_scanneler)}"
+                                except Exception as yara_e:
+                                    pass
 
-                        # 3. Análisis de Metadata (PE)
-                        if not suspicious:
-                            try:
-                                pe = pefile.PE(file_path, fast_load=True)
-                                if hasattr(pe, 'FileInfo'):
-                                    for file_info in pe.FileInfo:
-                                        if hasattr(file_info, 'StringTable'):
-                                            for st in file_info.StringTable:
-                                                for k, v in st.entries.items():
-                                                    val_dec = v.decode('utf-8', 'ignore').lower()
-                                                    for bad in internal_blackilst:
-                                                        if bad in val_dec: 
-                                                            suspicious = True
-                                                            reason = f"METADATA MATCH: {val_dec}"
-                                                            break
-                                pe.close()
-                            except: pass
+                            # C. Análisis de Metadata (PE)
+                            if not suspicious:
+                                try:
+                                    pe = pefile.PE(file_path, fast_load=True)
+                                    if hasattr(pe, 'FileInfo'):
+                                        for file_info in pe.FileInfo:
+                                            if hasattr(file_info, 'StringTable'):
+                                                for st in file_info.StringTable:
+                                                    for k, v in st.entries.items():
+                                                        val_dec = v.decode('utf-8', 'ignore').lower()
+                                                        for bad in internal_blackilst:
+                                                            if bad in val_dec: 
+                                                                suspicious = True
+                                                                reason = f"METADATA MATCH: {val_dec}"
+                                                                break
+                                    pe.close()
+                                except: pass
 
-                    except Exception as e: pass
+                            # REPORTE
+                            if suspicious: 
+                                detections += 1
+                                f.write(f"[!!!] CHEAT DETECTED: {file_name}\n")
+                                f.write(f"      Path: {file_path}\n")
+                                f.write(f"      Size: {size / 1024:.1f} KB\n")
+                                f.write(f"      Entropy: {entropy_val:.2f}\n")
+                                f.write(f"      Reason: {reason}\n")
+                                f.write("-" * 50 + "\n")
+                                f.flush()
+                            elif modo == "Analizar Todo": 
+                                f.write(f"[CLEAN] {file_name} (Ent: {entropy_val:.2f})\n")
+                        
+                        except (PermissionError, OSError):
+                            continue # Archivo bloqueado, saltar
+                            
+            except Exception as e:
+                f.write(f"[ERROR] Scanning folder {target_dir}: {e}\n")
 
-                    if suspicious: 
-                        f.write(f"[!!!] CHEAT DETECTED: {file_name}\n      Path: {file_path}\n      Entropy: {entropy_val:.2f}\n      Reason: {reason}\n" + "-"*50 + "\n")
-                        f.flush()
-                    elif modo == "Analizar Todo": 
-                        f.write(f"[CLEAN] {file_name} (Ent: {entropy_val:.2f})\n")
-                        f.flush()
-            except: pass
+        f.write(f"\nScan Finished. Files Checked: {total_scanned}. Detections: {detections}.\n")
+
+def filetime_to_dt(ft_dec):
+    try:
+        us = ft_dec / 10
+        return datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=us)
+    except: return None
 
 def fase_nuclear_traces(palabras, modo):
-    if cancelar_escaneo: return
-    print(f"[16/24] Nuclear Traces (BAM & Pipes) [DEFINITIVE]...")
+    # if cancelar_escaneo: return
+    print(f"[16/24] Nuclear Traces (Pipes & BAM with Timestamps) [DEFINITIVE]...")
+    
+    global reporte_nuclear
+    try:
+        base_path = HISTORIAL_RUTAS.get('path', os.path.abspath("."))
+        folder_name = HISTORIAL_RUTAS.get('folder', "Resultados_SS")
+    except:
+        base_path = os.path.abspath(".")
+        folder_name = "Resultados_SS"
+
+    reporte_nuclear = os.path.join(base_path, folder_name, "Nuclear_Traces_Detection.txt")
+
+    # Calculamos límite de tiempo (Ej: Últimas 4 horas)
+    # Todo lo que se haya ejecutado antes de esto, se ignora (o se marca como OLD)
+    now = datetime.datetime.now()
+    limit_time = now - datetime.timedelta(hours=4)
+
     with open(reporte_nuclear, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== NUCLEAR TRACES: {datetime.datetime.now()} ===\n\n")
+        f.write(f"=== NUCLEAR TRACES: {now.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        f.write("Target: Active Pipes & RECENT BAM Execution (Last 4 Hours)\n\n")
+        
+        # --- PART 1: NAMED PIPES (Tu código original, está perfecto) ---
         suspicious_pipes = ["cheat", "hack", "injector", "loader", "esp", "aim", "battleye", "easyanticheat", "faceit", "esea", "vanguard", "overlay", "hook", "auth"]
         f.write("--- LIVE NAMED PIPES ---\n")
         try:
             pipes = os.listdir(r'\\.\pipe\\')
+            found_pipe = False
             for pipe in pipes:
                 pipe_lower = pipe.lower()
-                if any(s in pipe_lower for s in suspicious_pipes): f.write(f"[PIPE DETECTED] Posible Hack Comms: {pipe}\n"); f.flush()
+                if any(s in pipe_lower for s in suspicious_pipes): 
+                    f.write(f"[PIPE DETECTED] Posible Hack Comms: {pipe}\n")
+                    found_pipe = True
+                
+                # Detectar UUIDs random (típico de clientes inyectados)
                 if len(pipe) > 20 and "-" in pipe and "{" not in pipe and "com" not in pipe:
-                     if modo == "Analizar Todo": f.write(f"[SUSPICIOUS PIPE] Random/UUID Pattern: {pipe}\n"); f.flush()
+                      if modo == "Analizar Todo": 
+                          f.write(f"[SUSPICIOUS PIPE] Random/UUID Pattern: {pipe}\n")
+            
+            if not found_pipe: f.write("[OK] No suspicious pipes found.\n")
+
         except Exception as e: f.write(f"Error scanning pipes: {e}\n")
-        f.write("\n--- BAM EXECUTION HISTORY ---\n")
+
+        # --- PART 2: BAM EXECUTION HISTORY (MEJORADO CON FECHAS) ---
+        f.write("\n--- BAM EXECUTION HISTORY (TIMESTAMPED) ---\n")
         try:
             bam_path = r"SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, bam_path) as k_bam:
+            # Necesitamos KEY_READ para leer valores
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, bam_path, 0, winreg.KEY_READ) as k_bam:
                 num_sids = winreg.QueryInfoKey(k_bam)[0]
+                
                 for i in range(num_sids):
                     sid = winreg.EnumKey(k_bam, i)
                     try:
-                        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{bam_path}\\{sid}") as k_user:
+                        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{bam_path}\\{sid}", 0, winreg.KEY_READ) as k_user:
                             num_vals = winreg.QueryInfoKey(k_user)[1]
+                            
+                            hits = 0
                             for j in range(num_vals):
-                                exe_path, _, _ = winreg.EnumValue(k_user, j)
-                                if "\\Device\\HarddiskVolume" in exe_path: exe_path = exe_path.replace("\\Device\\HarddiskVolume", "Volume")
-                                exe_lower = exe_path.lower(); hit = False; reason = ""
+                                # Aquí está la magia: value_data contiene la FECHA binaria
+                                exe_path, value_data, type_ = winreg.EnumValue(k_user, j)
+                                
+                                # Decodificar fecha (Primeros 8 bytes son FILETIME)
+                                try:
+                                    if type_ == winreg.REG_BINARY and len(value_data) >= 8:
+                                        filetime_int = struct.unpack('<Q', value_data[:8])[0]
+                                        exec_time = filetime_to_dt(filetime_int)
+                                    else:
+                                        exec_time = None
+                                except: exec_time = None
+
+                                # Normalización de ruta
+                                if "\\Device\\HarddiskVolume" in exe_path: 
+                                    exe_path = exe_path.replace("\\Device\\HarddiskVolume", "Volume_")
+                                
+                                exe_lower = exe_path.lower()
+                                
+                                # FILTROS LETALES
+                                is_recent = False
+                                if exec_time:
+                                    # Si la fecha es válida y es mayor (más nueva) que el límite
+                                    if exec_time > limit_time:
+                                        is_recent = True
+                                        time_str = exec_time.strftime('%H:%M:%S')
+                                    else:
+                                        # Si es viejo, lo saltamos para limpiar el reporte (o lo marcamos OLD)
+                                        # Para SS letal, nos interesa el "AHORA".
+                                        continue 
+                                else:
+                                    time_str = "Unknown Time"
+
+                                # Analisis de Keywords
+                                hit = False
+                                reason = ""
+
+                                # 1. Ejecución desde carpetas sospechosas (Temp, AppData)
                                 if "temp" in exe_lower or "appdata" in exe_lower:
-                                    if any(k in exe_lower for k in ["cheat", "loader", "inject", "priv", "vip"]): hit = True; reason = "Keyword in Temp Path"
-                                    elif modo == "Analizar Todo" and ".exe" in exe_lower: f.write(f"[BAM HISTORY] Executed from Temp: {exe_path}\n"); f.flush(); continue
-                                if "volume" in exe_lower and "program files" not in exe_lower and "windows" not in exe_lower: f.write(f"[BAM EXTERNAL] Executed from external drive: {exe_path}\n"); f.flush(); continue
-                                if any(p in exe_lower for p in palabras) or any(s in exe_lower for s in ["aimbot", "esp", "wallhack"]): hit = True; reason = "Keyword Match"
-                                if hit: f.write(f"[!!!] EXECUTION PROVEN: {exe_path}\n      (Este archivo se ejecuto en el pasado)\n"); f.flush()
-                    except: pass
+                                    if any(k in exe_lower for k in ["cheat", "loader", "inject", "priv", "vip", "client"]): 
+                                        hit = True; reason = "Keyword in Temp Path"
+                                    elif modo == "Analizar Todo" and ".exe" in exe_lower and is_recent:
+                                        # Si es reciente y está en temp, aunque no tenga nombre de cheat, es sospechoso
+                                        f.write(f"[RECENT TEMP] {time_str} | {exe_path}\n")
+                                        continue
+
+                                # 2. Ejecución externa (USB / Discos raros)
+                                if "volume_" in exe_lower and "program files" not in exe_lower and "windows" not in exe_lower: 
+                                    hit = True; reason = "External Drive / Hidden Volume"
+
+                                # 3. Keywords Generales
+                                if any(p in exe_lower for p in palabras) or any(s in exe_lower for s in ["aimbot", "esp", "wallhack", "clicker"]): 
+                                    hit = True; reason = "Keyword Match"
+
+                                # Escritura del reporte
+                                if hit and is_recent:
+                                    f.write(f"[!!!] EXECUTION PROVEN: {time_str} | {exe_path}\n")
+                                    f.write(f"      Reason: {reason}\n")
+                                    hits += 1
+                            
+                            if hits == 0:
+                                f.write(f"[INFO] SID {sid[:8]}... Clean in last 4 hours.\n")
+
+                    except Exception as e_inner: 
+                        # f.write(f"Error reading SID key: {e_inner}\n")
+                        pass
+
         except Exception as e: f.write(f"Error accessing BAM registry: {e}\n")
+        
+    print(f"   --> Reporte Nuclear generado: {reporte_nuclear}")
 
 def fase_kernel_hunter(palabras, modo):
     if cancelar_escaneo: return
@@ -2248,97 +2625,151 @@ def fase_metamorphosis_hunter(palabras, modo, target_file=None):
             f.write(f"\nScan finished. Analyzed {files_checked} files in {(time.time() - start_time):.2f}s. Detections: {detections}.\n")
             
 # --- FASE 26: STRING CLEANER & MEMORY MANIPULATION HUNTER ---
+import os
+import subprocess
+import datetime
+from datetime import timedelta
+
+# Asegúrate de que HISTORIAL_RUTAS esté disponible globalmente
+# global reporte_cleaning, HISTORIAL_RUTAS
+
+import os
+import subprocess
+import datetime
+
+# Asegúrate de que HISTORIAL_RUTAS esté disponible o maneja el error
+# global reporte_cleaning, HISTORIAL_RUTAS
+
 def fase_string_cleaning(palabras, modo):
-    if cancelar_escaneo: return
-    print("[26/26] String Cleaner & Memory Ops Hunter...")
+    # if cancelar_escaneo: return  <-- Descomenta si usas variable global
+    print("[26/26] String Cleaner & USN Resurrection (SPEED OPTIMIZED)...")
     
     global reporte_cleaning
-    base_path = HISTORIAL_RUTAS.get('path', os.path.abspath("."))
-    folder_name = HISTORIAL_RUTAS.get('folder', "Resultados_SS")
+    
+    # 1. Configuración de rutas
+    try:
+        base_path = HISTORIAL_RUTAS.get('path', os.path.abspath("."))
+        folder_name = HISTORIAL_RUTAS.get('folder', "Resultados_SS")
+    except:
+        base_path = os.path.abspath(".")
+        folder_name = "Resultados_SS"
+
     reporte_cleaning = os.path.join(base_path, folder_name, "String_Cleaner_Detection.txt")
 
-    # Herramientas conocidas de manipulación de memoria
+    # 2. Listas de detección
     cleaning_tools = [
-        "processhacker", "kprocesshacker", "cheatengine", "dbk64", "ksdumper", 
-        "pd-cleaner", "stringcleaner", "memreduct", "standbylist", "rammap", 
-        "process explorer", "system informer"
+        "processhacker", "kprocesshacker", "cheatengine", "ksdumper", 
+        "pd-cleaner", "stringcleaner", "lastactivityview", "everything", "dnspy",
+        "system informer", "usnanalytics", "process explorer"
     ]
-    
-    # Drivers de Kernel usados para limpiar memoria (R0)
-    suspicious_drivers = ["kprocesshacker.sys", "dbk64.sys", "dbk32.sys", "procexp.sys", "rwdrv.sys"]
+    suspicious_drivers = ["kprocesshacker.sys", "dbk64.sys", "rwdrv.sys", "inpoutx64.sys", "capcom.sys"]
+
+    now = datetime.datetime.now()
 
     with open(reporte_cleaning, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== MEMORY CLEANER & MANIPULATION SCAN: {datetime.datetime.now()} ===\n")
-        f.write("Targets: Memory Editors, RAM Cleaners, Kernel RW Drivers.\n\n")
+        f.write(f"=== FORENSIC DEEP SCAN: {now.strftime('%H:%M:%S')} ===\n")
+        f.write("Mode: SMART USN (Integrated Offset Calculation)\n\n")
 
-        # 1. BUSCAR PROCESOS ACTIVOS DE LIMPIEZA
-        f.write("--- ACTIVE MEMORY TOOLS ---\n")
+        # --- PARTE 1: HERRAMIENTAS ACTIVAS ---
+        f.write("--- [1] ACTIVE TOOLS ---\n")
         try:
             cmd = 'tasklist /fo csv /nh'
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True, text=True)
             out, _ = proc.communicate()
-            found_proc = False
+            found = False
             for line in out.splitlines():
-                line_low = line.lower()
-                if any(tool in line_low for tool in cleaning_tools):
-                    f.write(f"[!!!] ACTIVE TOOL DETECTED: {line.split(',')[0].strip()}\n")
-                    f.write("      (User is currently running a memory manipulator)\n")
-                    found_proc = True
-            if not found_proc: f.write("[OK] No memory cleaning tools running.\n")
+                if any(t in line.lower() for t in cleaning_tools):
+                    f.write(f"[!!!] RUNNING: {line.split(',')[0]}\n"); found = True
+            if not found: f.write("[OK] Clean.\n")
         except: pass
 
-        # 2. BUSCAR DRIVERS DE KERNEL CARGADOS (KProcessHacker es el más común para bypass)
-        f.write("\n--- KERNEL DRIVER ARTIFACTS ---\n")
+        # --- PARTE 2: DRIVERS ---
+        f.write("\n--- [2] DRIVERS ---\n")
         try:
             cmd = 'driverquery /fo csv /nh'
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True, text=True)
             out, _ = proc.communicate()
-            found_drv = False
+            found = False
             for line in out.splitlines():
-                line_low = line.lower()
-                if any(drv.replace(".sys","") in line_low for drv in suspicious_drivers):
-                    f.write(f"[!!!] MEMORY RW DRIVER LOADED: {line.split(',')[0].strip()}\n")
-                    f.write("      (Capabilities: Read/Write Kernel Memory - Anti-Anti-Cheat)\n")
-                    found_drv = True
-            if not found_drv: f.write("[OK] No standard cheating drivers found.\n")
+                if any(d.replace(".sys","") in line.lower() for d in suspicious_drivers):
+                    f.write(f"[!!!] DRIVER: {line.split(',')[0]}\n"); found = True
+            if not found: f.write("[OK] Clean.\n")
         except: pass
 
-        # 3. EVIDENCIA DE EJECUCIÓN PASADA (PREFETCH SPECÍFICO)
-        f.write("\n--- EXECUTION HISTORY (PREFETCH) ---\n")
-        try:
-            # Usamos lógica simple de lectura directa para velocidad
-            sysnative = r"C:\Windows\Sysnative\Prefetch"
-            pf_path = sysnative if os.path.exists(sysnative) else r"C:\Windows\Prefetch"
-            
-            if os.path.exists(pf_path):
-                found_pref = False
-                with os.scandir(pf_path) as entries:
-                    for entry in entries:
-                        name = entry.name.lower()
-                        if any(tool in name for tool in cleaning_tools):
-                            f.write(f"[HISTORY] Tool previously run: {entry.name}\n")
-                            found_pref = True
-                if not found_pref: f.write("[OK] No history of cleaning tools.\n")
-            else:
-                f.write("[ERROR] Cannot access Prefetch (Admin rights needed).\n")
-        except: pass
+        # --- PARTE 3: USN JOURNAL OPTIMIZADO (Lógica integrada) ---
+        f.write("\n--- [3] RECENTLY DELETED FILES (Smart Scan) ---\n")
+        f.write("Scanning tail of USN Journal (approx. last ~150MB of events)...\n")
         
-        # 4. DETECCION DE SERVICIOS (PERSISTENCIA)
-        f.write("\n--- SUSPICIOUS SERVICES ---\n")
         try:
-            # Buscamos servicios que contengan "Hacker" "Cheat" o "Kernel"
-            cmd = 'sc query state= all'
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-            out, _ = proc.communicate()
-            for line in out.splitlines():
-                if "SERVICE_NAME" in line:
-                    svc = line.split(":")[1].strip().lower()
-                    if "kprocesshacker" in svc or "dbk" in svc or "faceit" in svc or "vanguard" in svc:
-                        # Nota: Faceit/Vanguard no son cheats, pero son drivers de kernel interesantes de listar
-                        tag = "[CHEAT ENGINE DRIVER]" if "dbk" in svc else "[INFO]"
-                        if "kprocesshacker" in svc: tag = "[!!!] KPROCESS HACKER SERVICE"
-                        f.write(f"{tag} Service found: {svc}\n")
-        except: pass           
+            start_usn_hex = None
+            
+            # A) CALCULAR EL OFFSET (AQUÍ MISMO)
+            # Consultamos el estado actual del journal para saber dónde termina
+            try:
+                proc_q = subprocess.Popen("fsutil usn queryjournal C:", stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
+                out_q, _ = proc_q.communicate()
+                current_usn = 0
+                for line in out_q.splitlines():
+                    # Buscamos "Next Usn" (Ingles) o "Siguiente número de USN" (Español)
+                    # La clave es que suele ser el valor hexadecimal más alto en la salida
+                    if "usn" in line.lower() and ":" in line:
+                        parts = line.split(":")
+                        try:
+                            val = int(parts[1].strip(), 16)
+                            if val > current_usn: current_usn = val
+                        except: continue
+                
+                if current_usn > 0:
+                    # Retrocedemos 150MB (Bytes) para cubrir la última hora/sesión
+                    offset = 150 * 1024 * 1024
+                    start_val = max(0, current_usn - offset)
+                    start_usn_hex = hex(start_val)
+                    f.write(f"[DEBUG] Calculating offset... Start reading at USN: {start_usn_hex}\n")
+            except Exception as e_offset:
+                f.write(f"[DEBUG] Offset calculation failed ({str(e_offset)}). Fallback to full scan (slow).\n")
+
+            # B) EJECUTAR LA LECTURA
+            base_cmd = 'fsutil usn readjournal C: csv'
+            if start_usn_hex:
+                base_cmd += f' startusn={start_usn_hex}'
+
+            # Filtramos extensiones peligrosas + comprimidos + scripts
+            full_cmd = f'{base_cmd} | findstr /i ".exe .dll .bat .ps1 .jar .zip .rar .cfg .lua .ini"'
+            
+            proc = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True, errors='ignore')
+            out, err = proc.communicate()
+            
+            if not out:
+                f.write("[WARNING] No recent data found or Access Denied (Run as Admin).\n")
+            else:
+                lines = out.splitlines()
+                count_found = 0
+                # Procesamos las líneas
+                for line in lines:
+                    line_low = line.lower()
+                    
+                    # Filtros de ruido básicos
+                    if "windows\\servicing" in line_low or "mpam-" in line_low or "$recycle.bin" in line_low: continue
+
+                    # Detectar Borrado o Renombrado
+                    if "file delete" in line_low or "delete" in line_low or "rename" in line_low:
+                        parts = line.split(',')
+                        fname = parts[-1].strip() if len(parts) > 1 else "?"
+                        
+                        tag = "[DEL]" if "delete" in line_low else "[REN]"
+                        # Guardamos en el reporte
+                        f.write(f"{tag} {fname} | Raw: {line.strip()[:120]}\n")
+                        count_found += 1
+
+                if count_found == 0:
+                    f.write("[OK] No suspicious deletions found in the analyzed recent block.\n")
+                else:
+                    f.write(f"\n[INFO] Suspicious hits found: {count_found}\n")
+
+        except Exception as e:
+            f.write(f"[ERROR] Scan failed: {str(e)}\n")
+
+    print(f"   --> Reporte Optimizado listo en: {reporte_cleaning}")          
         
 
                  
@@ -2823,7 +3254,7 @@ class UserConfigFrame(tk.Frame):
         tk.Button(ctrl_fr, text=t("sel_all"), command=lambda: self.toggle_all(True), bg=COLOR_BG, fg=COLOR_SUCCESS, bd=0, font=("Consolas", 8, "bold"), cursor="hand2", activebackground=COLOR_BG, activeforeground="white").pack(side="right")
         tk.Button(ctrl_fr, text=t("desel_all"), command=lambda: self.toggle_all(False), bg=COLOR_BG, fg=COLOR_DANGER, bd=0, font=("Consolas", 8, "bold"), cursor="hand2", activebackground=COLOR_BG, activeforeground="white").pack(side="right", padx=10)
         
-        opts = [("Fase 1: ShimCache Analysis", 'f1'), ("Fase 2: AppCompat Store", 'f2'), ("Fase 3: Identity Verification", 'f3'), ("Fase 4: Digital Signatures", 'f4'), ("Fase 5: Keyword Search", 'f5'), ("Fase 6: Hidden Files Scan", 'f6'), ("Fase 7: MFT & ADS Scan", 'f7'), ("Fase 8: UserAssist (ROT13)", 'f8'), ("Fase 9: USB Device History", 'f9'), ("Fase 10: Active DNS Cache", 'f10'), ("Fase 11: Browser Forensics", 'f11'), ("Fase 12: Persistence", 'f12'), ("Fase 13: Windows Event Logs", 'f13'), ("Fase 14: RAM Process Hunter", 'f14'), ("Fase 15: Game Cheat Hunter (Deep)", 'f15'), ("Fase 16: Nuclear Traces (BAM/Pipes)", 'f16'), ("Fase 17: Kernel Hunter (Drivers)", 'f17'), ("Fase 18: DNA & Prefetch (Forensic)", 'f18'), ("Fase 19: Network Deep Inspection", 'f19'), ("Fase 20: Toxic LNK & Module Hunter", 'f20'), ("Fase 21: Ghost Trails (Registry MRU)", 'f21'), ("Fase 22: Memory Injection Hunter (Elite)", 'f22'), ("Fase 23: Rogue Driver Hunter (Kernel)", 'f23'),("Fase 24: Deep Static Heuristics (Hidden Files)", 'f24'), ("Fase 25: Metamorphosis Hunter (Hot-Swap)", 'f25'), ("F26: String Cleaner", 'f26'),("Cloud: VirusTotal API", 'vt')]
+        opts = [("Fase 1: ShimCache Analysis", 'f1'), ("Fase 2: AppCompat Store", 'f2'), ("Fase 3: Identity Verification", 'f3'), ("Fase 4: Digital Signatures", 'f4'), ("Fase 5: Keyword Search", 'f5'), ("Fase 6: Hidden Files Scan", 'f6'), ("Fase 7: MFT & ADS Scan", 'f7'), ("Fase 8: UserAssist (ROT13)", 'f8'), ("Fase 9: USB Device History", 'f9'), ("Fase 10: DNS and Discord Cache", 'f10'), ("Fase 11: Browser Forensics", 'f11'), ("Fase 12: Persistence", 'f12'), ("Fase 13: Windows Event Logs", 'f13'), ("Fase 14: RAM Process Hunter", 'f14'), ("Fase 15: Game Cheat Hunter (Deep)", 'f15'), ("Fase 16: Nuclear Traces (BAM/Pipes)", 'f16'), ("Fase 17: Kernel Hunter (Drivers)", 'f17'), ("Fase 18: DNA & Prefetch (Forensic)", 'f18'), ("Fase 19: Network Deep Inspection", 'f19'), ("Fase 20: Toxic LNK & Module Hunter", 'f20'), ("Fase 21: Ghost Trails (Registry MRU)", 'f21'), ("Fase 22: Memory Injection Hunter (Elite)", 'f22'), ("Fase 23: Rogue Driver Hunter (Kernel)", 'f23'),("Fase 24: Deep Static Heuristics (Hidden Files)", 'f24'), ("Fase 25: Metamorphosis Hunter (Hot-Swap)", 'f25'), ("F26: String Cleaner", 'f26'),("Cloud: VirusTotal API", 'vt')]
         for text, key in opts:
             r = tk.Frame(ob, bg=COLOR_CARD, pady=12, padx=15, highlightthickness=1, highlightbackground=COLOR_BORDER, bd=0)
             r.pack(fill="x", pady=6)
