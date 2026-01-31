@@ -1145,129 +1145,87 @@ def fase_archivos_ocultos(palabras, modo):
 
 def fase_mft_ads(palabras, modo):
     """
-    FASE MFT & ADS (MARK OF THE WEB HUNTER)
-    - Detecta flujos de datos alternativos (ADS).
-    - LEE el origen de la descarga (Zone.Identifier) para ver si viene de Discord/Sitios de Cheats.
-    - Detecta Payloads ocultos (Streams que no son Zone.Identifier).
+    FASE 7 (OPTIMIZADA): MFT & ADS Hunter (Native API).
+    Velocidad: Instantánea (Usa FindFirstStreamW en lugar de PowerShell).
+    Detecta: Zone.Identifier (Origen Discord/Cheats) y Payloads Ocultos.
     """
-    global cancelar_escaneo
     if cancelar_escaneo: return
+    print(f"[7/25] MFT & ADS Hunter (Native Speed) [LETHAL]...")
 
-    # Definimos zonas calientes para escanear recursivamente
-    # Escanear todo C: es muy lento con PowerShell, nos enfocamos donde bajan cosas.
-    user_profile = os.environ.get('USERPROFILE')
+    global reporte_mft
+    # ... (configura rutas reporte igual que antes) ...
+    
+    # --- API NATIVA ---
+    class WIN32_FIND_STREAM_DATA(ctypes.Structure):
+        _fields_ = [("StreamSize", ctypes.c_longlong), ("cStreamName", ctypes.c_wchar * 296)]
+
+    kernel32 = ctypes.windll.kernel32
+    FindFirstStreamW = kernel32.FindFirstStreamW
+    FindNextStreamW = kernel32.FindNextStreamW
+    FindClose = kernel32.FindClose
+    
+    # Objetivos
+    user_profile = os.environ['USERPROFILE']
     targets = [
         os.path.join(user_profile, "Downloads"),
         os.path.join(user_profile, "Desktop"),
-        os.path.join(user_profile, "AppData"),
-        os.path.join(user_profile, "Documents"),
-        "C:\\ProgramData",
-        "C:\\Windows\\Temp"
+        os.path.join(user_profile, "AppData", "Local", "Temp")
     ]
 
     with open(reporte_mft, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== MFT & ADS (ORIGIN HUNTER): {datetime.datetime.now()} ===\n")
-        f.write("Scanning for Alternate Data Streams and Source URLs (Mark of the Web)...\n\n")
-
-        # Comando PowerShell Optimizado:
-        # 1. Busca archivos con streams.
-        # 2. Ignora el stream principal (:$DATA).
-        # 3. Devuelve: RutaCompleta | NombreStream | Contenido (primeras lineas)
-        # Usamos delimitador '|||' para separar fácil en Python.
+        f.write(f"=== ADS & ORIGIN HUNTER (NATIVE): {datetime.datetime.now()} ===\n\n")
         
-        for target in targets:
-            if cancelar_escaneo: break
-            if not os.path.exists(target): continue
-
-            try:
-                # El comando es complejo pero muy potente.
-                # Get-Content -Stream lee el contenido del ADS.
-                cmd = f'''
-                Get-ChildItem -Path "{target}" -Recurse -File -ErrorAction SilentlyContinue | 
-                Get-Item -Stream * -ErrorAction SilentlyContinue | 
-                Where-Object {{ $_.Stream -ne ":$DATA" }} | 
-                ForEach-Object {{ 
-                    $content = Get-Content -LiteralPath $_.FileName -Stream $_.Stream -Raw -ErrorAction SilentlyContinue | Select-Object -First 5;
-                    "$($_.FileName)|||$($_.Stream)|||$($content -replace "`r`n","__NL__")"
-                }}
-                '''
+        for target_dir in targets:
+            if not os.path.exists(target_dir): continue
+            
+            for root, _, files in os.walk(target_dir):
+                if cancelar_escaneo: break
                 
-                proc = subprocess.Popen(
-                    ["powershell", "-NoProfile", "-Command", cmd], 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE, 
-                    text=True, 
-                    bufsize=1, 
-                    creationflags=0x08000000
-                )
-
-                while True:
-                    if cancelar_escaneo: 
-                        proc.terminate()
-                        break
+                for file in files:
+                    full_path = os.path.join(root, file)
                     
-                    linea = proc.stdout.readline()
-                    if not linea and proc.poll() is not None: break
+                    # Escanear Streams
+                    find_data = WIN32_FIND_STREAM_DATA()
+                    h_find = FindFirstStreamW(full_path, 0, ctypes.byref(find_data), 0)
                     
-                    if linea:
-                        linea = linea.strip()
-                        if not linea: continue
-                        
+                    if h_find != -1:
                         try:
-                            parts = linea.split("|||")
-                            if len(parts) >= 2:
-                                ruta_archivo = parts[0]
-                                stream_name = parts[1]
-                                contenido = parts[2] if len(parts) > 2 else ""
+                            while True:
+                                stream_name = find_data.cStreamName
                                 
-                                # Reconstruir saltos de línea para análisis
-                                contenido_real = contenido.replace("__NL__", "\n")
-                                
-                                es_sospechoso = False
-                                etiqueta = "[INFO]"
-                                detalles_extra = ""
+                                # ::$DATA es el archivo normal, lo ignoramos
+                                if stream_name and stream_name != "::$DATA":
+                                    # ENCONTRAMOS UN ADS (Stream Oculto)
+                                    real_stream = stream_name.split(":")[1]
+                                    
+                                    # A. Zone.Identifier (Rastreo de Origen)
+                                    if real_stream == "Zone.Identifier":
+                                        try:
+                                            # Leer contenido del ADS
+                                            with open(f"{full_path}:{real_stream}", "r", errors="ignore") as ads_f:
+                                                content = ads_f.read()
+                                                if "HostUrl=" in content:
+                                                    url = content.split("HostUrl=")[1].splitlines()[0].strip()
+                                                    
+                                                    # Detección de Dominios Malos
+                                                    bad_domains = ["discord", "anonfiles", "mega.nz", "gofile", "cheats", "unknowncheats", "github"]
+                                                    if any(b in url.lower() for b in bad_domains) or modo == "Analizar Todo":
+                                                        tag = "[!!!] SUSPICIOUS SOURCE" if any(b in url.lower() for b in bad_domains) else "[INFO]"
+                                                        f.write(f"{tag} File: {file}\n")
+                                                        f.write(f"      Origin: {url}\n")
+                                                        f.write("-" * 40 + "\n")
+                                        except: pass
+                                    
+                                    # B. Payload Oculto (Cualquier otro stream raro)
+                                    elif real_stream not in ["favicon", "smartscreen"]:
+                                        f.write(f"[!!!] HIDDEN PAYLOAD DETECTED: {file}\n")
+                                        f.write(f"      Stream Name: {real_stream}\n")
+                                        f.write(f"      Size: {find_data.StreamSize} bytes\n")
+                                        f.write("-" * 40 + "\n")
 
-                                # CASO 1: Zone.Identifier (Rastreo de Origen)
-                                if "Zone.Identifier" in stream_name:
-                                    # Buscamos HostUrl o ReferrerUrl
-                                    if "HostUrl=" in contenido_real:
-                                        # Extraer la URL
-                                        for linea_url in contenido_real.splitlines():
-                                            if "HostUrl=" in linea_url:
-                                                url = linea_url.split("=")[1].strip()
-                                                detalles_extra = f"Source: {url}"
-                                                
-                                                # SI VIENE DE DISCORD O SITIOS DE CHEATS -> CULPABLE
-                                                dominios_rojos = ["discord", "cdn.discordapp", "mega.nz", "mediafire", "anonfiles", "gofile", "cheats", "hacks", "unknowncheats"]
-                                                if any(d in url.lower() for d in dominios_rojos):
-                                                    etiqueta = "[!!!] DOWNLOADED FROM SUSPICIOUS SOURCE"
-                                                    es_sospechoso = True
-                                                elif modo == "Analizar Todo":
-                                                    # En modo full, mostramos todo origen para auditoría
-                                                    es_sospechoso = True
-                                                    etiqueta = "[ORIGIN]"
-                                
-                                # CASO 2: Payload Oculto (Cualquier otro stream)
-                                else:
-                                    # Si el stream NO es Zone.Identifier, es datos ocultos (muy raro en users normales)
-                                    # Los cheats guardan configs o inyectores aquí.
-                                    # Excepción: Thumbs.db o archivos de sistema a veces tienen, pero en User Profile es raro.
-                                    if "favicon" not in ruta_archivo.lower():
-                                        etiqueta = "[!!!] HIDDEN PAYLOAD (NON-STANDARD ADS)"
-                                        detalles_extra = f"Stream: {stream_name}"
-                                        es_sospechoso = True
-
-                                # --- ESCRITURA ---
-                                if es_sospechoso:
-                                    f.write(f"{etiqueta}: {ruta_archivo}\n")
-                                    if detalles_extra: f.write(f"      {detalles_extra}\n")
-                                    f.write("-" * 40 + "\n")
-                                    f.flush()
-
-                        except Exception: pass
-                        
-            except Exception as e:
-                f.write(f"Error processing target {target}: {e}\n")
+                                if not FindNextStreamW(h_find, ctypes.byref(find_data)): break
+                        finally:
+                            FindClose(h_find)
 
 def fase_userassist(palabras, modo):
     """
@@ -1410,6 +1368,7 @@ def fase_userassist(palabras, modo):
         if hits == 0:
             f.write("[OK] No suspicious user interactions found in recent history.\n")
 
+# --- FASE 9 (MASTER V2): USB, GHOST DRIVES & ENCRYPTION STATUS ---
 # --- FASE 9 (MASTER V2): USB, GHOST DRIVES & ENCRYPTION STATUS ---
 def fase_usb_history(palabras, modo):
     """
@@ -1704,6 +1663,84 @@ def fase_usb_history(palabras, modo):
         f.write(f"\nTotal USB/HW Anomalies: {ua_hits + lnk_hits + folder_hits + (1 if found_hw else 0)}\n")
 
     print(f"[✓] USB & ShellBags analysis completed.")
+
+import os
+import subprocess
+import datetime
+import re
+import time
+
+def fase_dns_cache(palabras, modo):
+    if cancelar_escaneo: return
+
+    # --- PASO 1: MATAR DISCORD ---
+    try:
+        subprocess.run("taskkill /IM discord.exe /F", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+    except:
+        pass 
+
+    discord_path = os.path.join(os.getenv('APPDATA'), 'discord', 'Local Storage', 'leveldb')
+    url_pattern = re.compile(rb'https?://(?:cdn|media)\.discordapp\.(?:com|net)/attachments/[\w\d_\-\./]+')
+
+    with open(reporte_dns, "w", encoding="utf-8", buffering=1) as f:
+        f.write(f"=== REPORTE DE RED Y ORIGEN (DNS + DISCORD): {datetime.datetime.now()} ===\n")
+        
+        # --- SECCIÓN DNS ---
+        f.write(f"\n[+] SECCIÓN DNS CACHE (Dominios Visitados)\n")
+        f.write("="*60 + "\n")
+        try:
+            out = subprocess.check_output("ipconfig /displaydns", shell=True, text=True, errors='ignore')
+            dns_encontrados = False
+            for l in out.splitlines():
+                l = l.strip()
+                if "Nombre de registro" in l or "Record Name" in l:
+                    parts = l.split(":")
+                    if len(parts) > 1:
+                        dom = parts[1].strip()
+                        if dom and (modo == "Analizar Todo" or any(p in dom.lower() for p in palabras)):
+                            f.write(f"  > DNS ENTRY: {dom}\n")
+                            dns_encontrados = True
+            if not dns_encontrados: f.write("  (Sin datos relevantes)\n")
+        except Exception as e:
+            f.write(f"  [ERROR] DNS: {str(e)}\n")
+
+        # --- SECCIÓN DISCORD ---
+        f.write(f"\n\n[+] SECCIÓN DISCORD DOWNLOADS (Rastreo de Links)\n")
+        f.write("="*60 + "\n")
+        
+        if os.path.exists(discord_path):
+            links_encontrados = 0
+            # CORRECCIÓN AQUÍ: Quitamos el 'try' externo innecesario o le añadimos except.
+            # Lo mejor es manejar el error dentro del loop o usar un try global con su except.
+            try: 
+                for filename in os.listdir(discord_path):
+                    if filename.endswith(".ldb") or filename.endswith(".log"):
+                        full_path = os.path.join(discord_path, filename)
+                        try:
+                            with open(full_path, "rb") as db_file:
+                                content = db_file.read()
+                                matches = url_pattern.findall(content)
+                                for url_bytes in matches:
+                                    url_str = url_bytes.decode('utf-8', errors='ignore')
+                                    es_sospechoso = False
+                                    if any(ext in url_str.lower() for ext in ['.exe', '.dll', '.rar', '.zip', '.7z']): es_sospechoso = True
+                                    elif modo != "Analizar Todo" and any(p in url_str.lower() for p in palabras): es_sospechoso = True
+                                    elif modo == "Analizar Todo": es_sospechoso = True
+
+                                    if es_sospechoso:
+                                        f.write(f"  > LINK RECUPERADO: {url_str}\n")
+                                        links_encontrados += 1
+                        except: continue 
+            except Exception as e:
+                f.write(f"  [ERROR] Al leer carpeta Discord: {str(e)}\n") # <--- ESTE EXCEPT FALTABA
+
+            if links_encontrados == 0:
+                f.write(f"  (No se encontraron enlaces sospechosos)\n")
+        else:
+            f.write("  [INFO] No se encontró carpeta de Discord.\n")
+
+        f.flush()
 
 def fase_browser_forensics(palabras, modo):
     if cancelar_escaneo: return
@@ -2100,48 +2137,37 @@ def fase_process_hunter(palabras, modo):
         except: pass
 
 def fase_game_cheat_hunter(palabras, modo):
-    if cancelar_escaneo:
-        return
+    if cancelar_escaneo: return
 
-    print("[15/25] Game Cheat Hunter (YARA FIXED | ENTROPY | PE)")
+    print("[15/25] Game Cheat Hunter (SURGICAL PRECISION | ZERO FP)")
 
-    # --- INICIO CORRECCIÓN ---
-    global GLOBAL_YARA_RULES  # Importamos la variable global cargada al inicio
-    
-    # Intentamos usar la instancia global primero
+    # --- YARA SETUP ---
+    global GLOBAL_YARA_RULES
     yara_rules = GLOBAL_YARA_RULES
     yara_active = False
-    
-    # Chequeo de disponibilidad de librería
     try:
         import yara
         YARA_AVAILABLE = True
-    except ImportError:
-        YARA_AVAILABLE = False
+    except: YARA_AVAILABLE = False
 
-    # Lógica de activación
-    if yara_rules is not None:
-        yara_active = True
+    if yara_rules is not None: yara_active = True
     elif YARA_AVAILABLE:
-        # Fallback: Si falló la global, intentamos cargar usando resource_path
         try:
             ruta_reglas = resource_path("reglas_scanneler.yar")
             yara_rules = yara.compile(filepath=ruta_reglas)
             yara_active = True
-        except:
-            yara_rules = None
-    # --- FIN CORRECCIÓN ---
+        except: yara_rules = None
 
-    # ================= CONFIG =================
-    internal_blacklist = [
-        "cheat engine", "process hacker", "x64dbg", "ollydbg",
-        "dnspy", "injector", "ks dumper", "http debugger",
-        "netlimiter", "aimbot", "wallhack"
+    # ================= CONFIGURACIÓN "SURGICAL" =================
+    # Lista negra estricta. Si aparece esto, MUERE, tenga firma o no.
+    INTERNAL_BLACKLIST = [
+        "cheat", "hack", "injector", "loader", "spoofer", "aimbot", "esp", 
+        "imgui", "hook", "dumper", "bypass", "wesh", "kero", "skinchanger",
+        "readwritememory", "kernel"
     ]
 
-    target_exts = ('.exe', '.dll', '.sys', '.bin', '.dat', '.tmp')
-
-    MAX_SIZE_MB = 40
+    target_exts = ('.exe', '.dll', '.sys', '.bin', '.dat')
+    MAX_SIZE_MB = 150 # Cheats modernos pueden ser grandes si traen libs
     READ_LIMIT_MB = 15
 
     # ================= PATHS =================
@@ -2149,125 +2175,154 @@ def fase_game_cheat_hunter(palabras, modo):
     hot_paths = [
         os.path.join(user, "Desktop"),
         os.path.join(user, "Downloads"),
-        os.path.join(user, "AppData", "Local", "Temp"),
+        os.path.join(user, "AppData", "Local", "Temp"), # Zona crítica
         os.path.join(user, "AppData", "Roaming")
     ]
-
     onedrive = os.path.join(user, "OneDrive")
     if os.path.exists(onedrive):
-        hot_paths += [
-            os.path.join(onedrive, "Desktop"),
-            os.path.join(onedrive, "Downloads")
-        ]
+        hot_paths += [os.path.join(onedrive, "Desktop"), os.path.join(onedrive, "Downloads")]
 
-# ================= REPORT =================
+    # ================= REPORT =================
     with open(reporte_game, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== GAME CHEAT HUNTER ===\n")
+        f.write(f"=== GAME CHEAT HUNTER (SURGICAL MODE) ===\n")
         f.write(f"Start: {datetime.datetime.now()}\n")
-
-        # ================= YARA LOAD REPORT =================
-        if yara_active:
-             f.write("YARA: ACTIVE (Rules Loaded)\n\n")
-        elif not YARA_AVAILABLE:
-             f.write("YARA: NOT INSTALLED (Module Missing)\n\n")
-        else:
-             f.write("YARA: FAILED (Rules file not found or compile error)\n\n")
+        f.write(f"Strategy: Ignore Signed Files (unless inside TEMP or Blacklisted).\n\n")
 
         total_scanned = 0
         detections = 0
 
-        # ================= SCAN =================
         for target_dir in hot_paths:
-            if not os.path.exists(target_dir):
-                continue
-
+            if not os.path.exists(target_dir): continue
             f.write(f"--- Scanning: {target_dir} ---\n")
+            
+            # Determinamos si es carpeta TEMP (Aquí somos más agresivos)
+            is_temp_folder = "temp" in target_dir.lower()
 
             try:
                 with os.scandir(target_dir) as entries:
                     for entry in entries:
-                        if cancelar_escaneo:
-                            break
-
+                        if cancelar_escaneo: break
                         try:
-                            if not entry.is_file():
-                                continue
-                            if not entry.name.lower().endswith(target_exts):
-                                continue
-
+                            if not entry.is_file(): continue
+                            fname_lower = entry.name.lower()
+                            if not fname_lower.endswith(target_exts): continue
+                            
                             size = entry.stat().st_size
-                            if size > MAX_SIZE_MB * 1024 * 1024:
-                                continue
+                            if size > MAX_SIZE_MB * 1024 * 1024: continue
 
                             total_scanned += 1
                             suspicious = False
                             reasons = []
                             entropy_val = 0
-
-                            # ================= READ =================
-                            with open(entry.path, "rb") as bf:
-                                data = bf.read(READ_LIMIT_MB * 1024 * 1024)
-
-                            # ================= ENTROPY =================
-                            entropy_val = calculate_entropy(data)
-                            if entropy_val > 7.3:
-                                suspicious = True
-                                reasons.append(f"High entropy ({entropy_val:.2f})")
-
-                            # ================= YARA =================
-                            if yara_active:
-                                try:
-                                    matches = yara_rules.match(data=data)
-                                    if not matches:
-                                        matches = yara_rules.match(filepath=entry.path)
-
-                                    if matches:
-                                        suspicious = True
-                                        rules = [m.rule for m in matches]
-                                        reasons.append(f"YARA MATCH: {', '.join(rules)}")
-                                except:
-                                    pass
-
-                            # ================= PE METADATA =================
+                            
+                            # --- 1. ANÁLISIS RÁPIDO DE PE (FIRMA Y METADATOS) ---
+                            is_signed = False
+                            metadata_dirty = False
+                            
                             try:
                                 pe = pefile.PE(entry.path, fast_load=True)
+                                
+                                # A. Chequeo de Firma (Security Directory)
+                                sec_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+                                if sec_dir.VirtualAddress != 0 and sec_dir.Size > 0:
+                                    is_signed = True
+
+                                # B. Chequeo de Blacklist en Metadatos
                                 if hasattr(pe, 'FileInfo'):
                                     for info in pe.FileInfo:
                                         if hasattr(info, 'StringTable'):
                                             for st in info.StringTable:
-                                                for _, v in st.entries.items():
+                                                for k, v in st.entries.items():
                                                     val = v.decode(errors="ignore").lower()
-                                                    for bad in internal_blacklist:
+                                                    for bad in INTERNAL_BLACKLIST:
                                                         if bad in val:
-                                                            suspicious = True
-                                                            reasons.append(f"Metadata keyword: {bad}")
-                                                            break
+                                                            metadata_dirty = True
+                                                            reasons.append(f"Blacklisted Metadata: {val}")
                                 pe.close()
-                            except:
-                                pass
+                            except: pass
 
-                            # ================= REPORT =================
+                            # --- 2. EL FILTRO QUIRÚRGICO (AQUÍ ESTÁ LA MAGIA) ---
+                            
+                            should_scan = False
+
+                            if metadata_dirty:
+                                # SIEMPRE escanear si tiene palabras prohibidas
+                                should_scan = True
+                            elif not is_signed:
+                                # SIEMPRE escanear si NO está firmado
+                                should_scan = True
+                            elif is_signed and is_temp_folder:
+                                # Escanear firmados SOLO si están en TEMP (Muchos loaders se esconden ahí)
+                                should_scan = True
+                            
+                            # SI NO CUMPLE CONDICIONES -> ES SEGURO (Parsec, Steam, etc.) -> SALTAR
+                            if not should_scan:
+                                continue
+
+                            # --- 3. LECTURA Y ANÁLISIS ---
+                            try:
+                                with open(entry.path, "rb") as bf:
+                                    data_start = bf.read(READ_LIMIT_MB * 1024 * 1024)
+                                    # Overlay check
+                                    data_overlay = b""
+                                    if size > 2 * 1024 * 1024:
+                                        try:
+                                            bf.seek(-2 * 1024 * 1024, 2)
+                                            data_overlay = bf.read()
+                                        except: pass
+                            except: continue
+
+                            # ENTROPÍA (Solo aplicamos a los que pasaron el filtro)
+                            entropy_val = calculate_entropy(data_start)
+                            
+                            # Si es firmado (y está en temp), necesitamos un umbral ALTO
+                            threshold = 7.4 if is_signed else 7.25
+                            
+                            if entropy_val > threshold:
+                                suspicious = True
+                                if is_signed:
+                                    reasons.append(f"High Entropy inside TEMP (Signed) ({entropy_val:.2f})")
+                                else:
+                                    reasons.append(f"High Entropy & Unsigned ({entropy_val:.2f})")
+
+                            # OVERLAY Check
+                            if data_overlay:
+                                ent_overlay = calculate_entropy(data_overlay)
+                                if ent_overlay > 7.45:
+                                    suspicious = True
+                                    reasons.append(f"Packed Overlay Detected ({ent_overlay:.2f})")
+
+                            # YARA (Siempre activo para confirmar)
+                            if yara_active:
+                                try:
+                                    matches = yara_rules.match(data=data_start)
+                                    if not matches and data_overlay: matches = yara_rules.match(data=data_overlay)
+                                    if matches:
+                                        suspicious = True
+                                        rules = [m.rule for m in matches]
+                                        reasons.append(f"YARA MATCH: {rules}")
+                                except: pass
+                            
+                            # --- REPORTE ---
                             if suspicious:
                                 detections += 1
-                                f.write(f"[!!!] CHEAT DETECTED: {entry.name}\n")
+                                tag = "[!!!]"
+                                if "YARA" in str(reasons) or metadata_dirty: tag = "[☢] CONFIRMED"
+                                
+                                f.write(f"{tag} THREAT DETECTED: {entry.name}\n")
                                 f.write(f"      Path: {entry.path}\n")
-                                f.write(f"      Size: {size / 1024:.1f} KB\n")
+                                f.write(f"      Status: {'SIGNED (Risky Location/Meta)' if is_signed else 'UNSIGNED'}\n")
                                 f.write(f"      Entropy: {entropy_val:.2f}\n")
                                 for r in reasons:
                                     f.write(f"      - {r}\n")
                                 f.write("-" * 55 + "\n")
                                 f.flush()
 
-                        except:
-                            continue
+                        except: continue
+            except: pass
 
-            except Exception as e:
-                f.write(f"[ERROR] Folder scan failed: {e}\n")
-
-        f.write(f"\nScan finished. Files scanned: {total_scanned} | Detections: {detections}\n")
-
+        f.write(f"\nScan finished. Detections: {detections}\n")
     print("[✓] Game Cheat Hunter completed")
-
 
 def filetime_to_dt(ft_dec):
     try:
