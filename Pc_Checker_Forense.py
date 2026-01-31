@@ -1413,17 +1413,33 @@ def fase_userassist(palabras, modo):
 # --- FASE 9 (MASTER V2): USB, GHOST DRIVES & ENCRYPTION STATUS ---
 def fase_usb_history(palabras, modo):
     """
-    FASE USB FORENSICS v4.1 (FIXED)
-    - Corrección de error de sintaxis en bloque UserAssist.
-    - Detecta Hardware de Cheats (Arduino/DMA).
-    - Muestra ejecución desde USBs.
+    FASE USB FORENSICS v5.0 (LETHAL)
+    - Detecta Hardware Cheats (Arduino/DMA).
+    - Muestra ejecución desde USBs (UserAssist).
+    - Rastrea carpetas abiertas en USBs retirados (ShellBags).
     """
     if cancelar_escaneo: return
-    print(f"[9/26] USB Execution & Hardware Forensics [NUCLEAR SCAN]...")
+    print(f"[9/26] USB History & ShellBags (Devices + Folder Access) [LETHAL]")
 
-    with open(reporte_usb, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== USB EXECUTION & HARDWARE FORENSICS: {datetime.datetime.now()} ===\n")
-        f.write("Target: Hardware Cheats, USB Execution History & Removed Drive Traces.\n\n")
+    import winreg
+    import struct
+    import re
+    import datetime
+    import subprocess
+    import codecs
+
+    # Configuración de reporte
+    # Asegúrate de que 'reporte_usb' esté definido globalmente o usa la ruta relativa
+    try:
+        report_file = reporte_usb
+    except:
+        base_path = HISTORIAL_RUTAS.get("path", os.path.abspath("."))
+        folder = HISTORIAL_RUTAS.get("folder", "Resultados_SS")
+        report_file = os.path.join(base_path, folder, "USB_Hardware_Report.txt")
+
+    with open(report_file, "w", encoding="utf-8", buffering=1) as f:
+        f.write(f"=== USB EXECUTION & SHELLBAGS FORENSICS: {datetime.datetime.now()} ===\n")
+        f.write("Target: Hardware Cheats, Removed Drives & Folder Access History.\n\n")
 
         # -------------------------------------------------------------------------
         # 1. MAPEO DE UNIDADES
@@ -1489,9 +1505,11 @@ def fase_usb_history(palabras, modo):
                                             try: name, _ = winreg.QueryValueEx(inst_key, "DeviceDesc")
                                             except: name = "Unknown Device"
                                         
-                                        ts_ns = winreg.QueryInfoKey(inst_key)[2]
-                                        dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ts_ns/10)
-                                        last_seen = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        try:
+                                            ts_ns = winreg.QueryInfoKey(inst_key)[2]
+                                            dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ts_ns/10)
+                                            last_seen = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        except: last_seen = "Unknown"
 
                                         if threat_msg:
                                             f.write(f"[!!!] HARDWARE CHEAT DETECTED: {threat_msg}\n")
@@ -1503,7 +1521,6 @@ def fase_usb_history(palabras, modo):
                                         elif "MassStorage" in device_key_name or "DISK" in name.upper() or "USB" in name.upper():
                                              f.write(f"[HISTORY] {name} (Last: {last_seen})\n")
                         except: continue
-
         except Exception as e: f.write(f"Error scanning USB Registry: {e}\n")
         
         if not found_hw: f.write("[OK] No specific Hardware Cheat IDs found.\n")
@@ -1519,8 +1536,6 @@ def fase_usb_history(palabras, modo):
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ua_path) as k_ua:
                 for i in range(winreg.QueryInfoKey(k_ua)[0]):
                     guid = winreg.EnumKey(k_ua, i)
-                    
-                    # --- AQUÍ ESTABA EL ERROR: FALTABA CERRAR ESTE TRY ---
                     try:
                         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{ua_path}\\{guid}\\Count") as k_c:
                             for j in range(winreg.QueryInfoKey(k_c)[1]):
@@ -1545,10 +1560,12 @@ def fase_usb_history(palabras, modo):
                                 if is_usb_exec:
                                     last_run = "Unknown"
                                     if len(data) >= 68:
-                                        ft = struct.unpack('<Q', data[60:68])[0]
-                                        if ft > 0:
-                                            dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ft/10)
-                                            last_run = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        try:
+                                            ft = struct.unpack('<Q', data[60:68])[0]
+                                            if ft > 0:
+                                                dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ft/10)
+                                                last_run = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        except: pass
 
                                     if n_real.lower().endswith((".exe", ".bat", ".cmd", ".ps1")):
                                         tag = "[!!!]"
@@ -1559,8 +1576,7 @@ def fase_usb_history(palabras, modo):
                                         f.write(f"      Last Run: {last_run}\n")
                                         f.write("-" * 40 + "\n")
                                         ua_hits += 1
-                    except: 
-                        continue # <--- ESTA LÍNEA FALTABA
+                    except: continue
 
         except Exception as e: f.write(f"Error reading UserAssist: {e}\n")
         
@@ -1610,83 +1626,84 @@ def fase_usb_history(palabras, modo):
         
         if lnk_hits == 0: f.write("[OK] No suspicious shortcuts to external drives found.\n")
 
-import os
-import subprocess
-import datetime
-import re
-import time
+        # -------------------------------------------------------------------------
+        # 5. SHELLBAGS (FOLDER ACCESS HISTORY) - NUEVA SECCIÓN INTEGRADA
+        # -------------------------------------------------------------------------
+        f.write("\n--- [4] SHELLBAGS (Folder Access History) ---\n")
+        f.write("Detects specific folders opened by the user, even if the drive is gone.\n\n")
 
-def fase_dns_cache(palabras, modo):
-    if cancelar_escaneo: return
+        folder_hits = 0
+        KEYS_SHELLBAGS = [
+            r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU",
+            r"Software\Microsoft\Windows\Shell\BagMRU"
+        ]
 
-    # --- PASO 1: MATAR DISCORD ---
-    try:
-        subprocess.run("taskkill /IM discord.exe /F", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-    except:
-        pass 
+        # Helper interno para limpieza de strings
+        def _extract_clean_strings(data):
+            try:
+                text = data.decode('utf-16-le', errors='ignore')
+                return re.findall(r'[a-zA-Z0-9_\-\. \(\)\[\]]{4,}', text)
+            except: return []
 
-    discord_path = os.path.join(os.getenv('APPDATA'), 'discord', 'Local Storage', 'leveldb')
-    url_pattern = re.compile(rb'https?://(?:cdn|media)\.discordapp\.(?:com|net)/attachments/[\w\d_\-\./]+')
+        # Walker recursivo interno
+        def _walk_shellbags(key_path, hits_list):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                    # Leer Valores
+                    try:
+                        i = 0
+                        while True:
+                            if cancelar_escaneo: break
+                            _, val_data, val_type = winreg.EnumValue(key, i)
+                            if val_type == winreg.REG_BINARY:
+                                names = _extract_clean_strings(val_data)
+                                for n in names:
+                                    if len(n) < 3: continue
+                                    # Whitelist básica
+                                    if n.lower() in ["quick access", "this pc", "network", "recycle bin", "control panel", "documents", "pictures", "desktop", "downloads", "music", "videos"]:
+                                        continue
+                                    
+                                    # Detección
+                                    is_sus = False
+                                    for p in palabras:
+                                        if p.lower() in n.lower():
+                                            is_sus = True
+                                            break
+                                    
+                                    if is_sus:
+                                        hits_list.append(n)
+                            i += 1
+                    except OSError: pass
 
-    with open(reporte_dns, "w", encoding="utf-8", buffering=1) as f:
-        f.write(f"=== REPORTE DE RED Y ORIGEN (DNS + DISCORD): {datetime.datetime.now()} ===\n")
-        
-        # --- SECCIÓN DNS ---
-        f.write(f"\n[+] SECCIÓN DNS CACHE (Dominios Visitados)\n")
-        f.write("="*60 + "\n")
-        try:
-            out = subprocess.check_output("ipconfig /displaydns", shell=True, text=True, errors='ignore')
-            dns_encontrados = False
-            for l in out.splitlines():
-                l = l.strip()
-                if "Nombre de registro" in l or "Record Name" in l:
-                    parts = l.split(":")
-                    if len(parts) > 1:
-                        dom = parts[1].strip()
-                        if dom and (modo == "Analizar Todo" or any(p in dom.lower() for p in palabras)):
-                            f.write(f"  > DNS ENTRY: {dom}\n")
-                            dns_encontrados = True
-            if not dns_encontrados: f.write("  (Sin datos relevantes)\n")
-        except Exception as e:
-            f.write(f"  [ERROR] DNS: {str(e)}\n")
+                    # Recursión
+                    try:
+                        j = 0
+                        while True:
+                            if cancelar_escaneo: break
+                            subkey = winreg.EnumKey(key, j)
+                            _walk_shellbags(f"{key_path}\\{subkey}", hits_list)
+                            j += 1
+                    except OSError: pass
+            except: pass
 
-        # --- SECCIÓN DISCORD ---
-        f.write(f"\n\n[+] SECCIÓN DISCORD DOWNLOADS (Rastreo de Links)\n")
-        f.write("="*60 + "\n")
-        
-        if os.path.exists(discord_path):
-            links_encontrados = 0
-            # CORRECCIÓN AQUÍ: Quitamos el 'try' externo innecesario o le añadimos except.
-            # Lo mejor es manejar el error dentro del loop o usar un try global con su except.
-            try: 
-                for filename in os.listdir(discord_path):
-                    if filename.endswith(".ldb") or filename.endswith(".log"):
-                        full_path = os.path.join(discord_path, filename)
-                        try:
-                            with open(full_path, "rb") as db_file:
-                                content = db_file.read()
-                                matches = url_pattern.findall(content)
-                                for url_bytes in matches:
-                                    url_str = url_bytes.decode('utf-8', errors='ignore')
-                                    es_sospechoso = False
-                                    if any(ext in url_str.lower() for ext in ['.exe', '.dll', '.rar', '.zip', '.7z']): es_sospechoso = True
-                                    elif modo != "Analizar Todo" and any(p in url_str.lower() for p in palabras): es_sospechoso = True
-                                    elif modo == "Analizar Todo": es_sospechoso = True
+        # Ejecución ShellBags
+        detected_folders = []
+        for k in KEYS_SHELLBAGS:
+            if cancelar_escaneo: break
+            _walk_shellbags(k, detected_folders)
 
-                                    if es_sospechoso:
-                                        f.write(f"  > LINK RECUPERADO: {url_str}\n")
-                                        links_encontrados += 1
-                        except: continue 
-            except Exception as e:
-                f.write(f"  [ERROR] Al leer carpeta Discord: {str(e)}\n") # <--- ESTE EXCEPT FALTABA
-
-            if links_encontrados == 0:
-                f.write(f"  (No se encontraron enlaces sospechosos)\n")
+        # Reportar ShellBags
+        detected_folders = list(set(detected_folders)) # Eliminar duplicados
+        if detected_folders:
+            for folder in detected_folders:
+                f.write(f"[!!!] SUSPICIOUS FOLDER ACCESSED: {folder}\n")
+                folder_hits += 1
         else:
-            f.write("  [INFO] No se encontró carpeta de Discord.\n")
+            f.write("[OK] No suspicious folder names found in ShellBags.\n")
 
-        f.flush()
+        f.write(f"\nTotal USB/HW Anomalies: {ua_hits + lnk_hits + folder_hits + (1 if found_hw else 0)}\n")
+
+    print(f"[✓] USB & ShellBags analysis completed.")
 
 def fase_browser_forensics(palabras, modo):
     if cancelar_escaneo: return
