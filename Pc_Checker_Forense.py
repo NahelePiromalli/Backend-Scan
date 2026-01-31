@@ -2088,11 +2088,32 @@ def fase_game_cheat_hunter(palabras, modo):
 
     print("[15/25] Game Cheat Hunter (YARA FIXED | ENTROPY | PE)")
 
+    # --- INICIO CORRECCIÓN ---
+    global GLOBAL_YARA_RULES  # Importamos la variable global cargada al inicio
+    
+    # Intentamos usar la instancia global primero
+    yara_rules = GLOBAL_YARA_RULES
+    yara_active = False
+    
+    # Chequeo de disponibilidad de librería
     try:
         import yara
         YARA_AVAILABLE = True
-    except:
+    except ImportError:
         YARA_AVAILABLE = False
+
+    # Lógica de activación
+    if yara_rules is not None:
+        yara_active = True
+    elif YARA_AVAILABLE:
+        # Fallback: Si falló la global, intentamos cargar usando resource_path
+        try:
+            ruta_reglas = resource_path("reglas_scanneler.yar")
+            yara_rules = yara.compile(filepath=ruta_reglas)
+            yara_active = True
+        except:
+            yara_rules = None
+    # --- FIN CORRECCIÓN ---
 
     # ================= CONFIG =================
     internal_blacklist = [
@@ -2122,24 +2143,18 @@ def fase_game_cheat_hunter(palabras, modo):
             os.path.join(onedrive, "Downloads")
         ]
 
-    # ================= REPORT =================
+# ================= REPORT =================
     with open(reporte_game, "w", encoding="utf-8", buffering=1) as f:
         f.write(f"=== GAME CHEAT HUNTER ===\n")
         f.write(f"Start: {datetime.datetime.now()}\n")
 
-        # ================= YARA LOAD =================
-        yara_rules = None
-        yara_active = False
-
-        if YARA_AVAILABLE:
-            try:
-                yara_rules = yara.compile(filepath="reglas_scanneler.yar")
-                yara_active = True
-                f.write("YARA: ACTIVE\n\n")
-            except Exception as e:
-                f.write(f"YARA: FAILED ({e})\n\n")
+        # ================= YARA LOAD REPORT =================
+        if yara_active:
+             f.write("YARA: ACTIVE (Rules Loaded)\n\n")
+        elif not YARA_AVAILABLE:
+             f.write("YARA: NOT INSTALLED (Module Missing)\n\n")
         else:
-            f.write("YARA: NOT INSTALLED\n\n")
+             f.write("YARA: FAILED (Rules file not found or compile error)\n\n")
 
         total_scanned = 0
         detections = 0
@@ -3024,6 +3039,11 @@ def fase_deep_static(*args):
     if 'HISTORIAL_RUTAS' not in globals():
         HISTORIAL_RUTAS = {'path': os.path.abspath("."), 'folder': "Resultados_SS"}
 
+    # --- CORRECCIÓN: Traer variable global de YARA ---
+    global GLOBAL_YARA_RULES
+    if 'GLOBAL_YARA_RULES' not in globals():
+        GLOBAL_YARA_RULES = None
+
     if cancelar_escaneo:
         return
 
@@ -3057,12 +3077,21 @@ def fase_deep_static(*args):
     # ======================================================
     # 6. YARA LOAD (FIX REAL)
     # ======================================================
-    yara_rules = None
+    yara_rules = GLOBAL_YARA_RULES # Intentar usar la global cargada al inicio
     yara_active = False
 
-    if YARA_AVAILABLE:
+    if yara_rules is not None:
+        yara_active = True
+    elif YARA_AVAILABLE:
+        # Fallback: Si falló la global, intentamos cargar localmente
         try:
-            yara_rules = yara.compile(filepath="reglas_scanneler.yar")
+            # Intentamos usar resource_path si existe (del script principal)
+            try:
+                ruta_reglas = resource_path("reglas_scanneler.yar")
+            except NameError:
+                ruta_reglas = "reglas_scanneler.yar"
+            
+            yara_rules = yara.compile(filepath=ruta_reglas)
             yara_active = True
         except Exception as e:
             yara_active = False
@@ -3090,7 +3119,14 @@ def fase_deep_static(*args):
     with open(report_path, "w", encoding="utf-8", buffering=1) as f:
         f.write(f"=== DEEP STATIC ANALYSIS ===\n")
         f.write(f"Time: {datetime.datetime.now()}\n")
-        f.write(f"YARA: {'ACTIVE' if yara_active else 'DISABLED'}\n\n")
+        
+        # Reporte de estado claro
+        if yara_active:
+             f.write("YARA: ACTIVE (Rules Loaded)\n\n")
+        elif not YARA_AVAILABLE:
+             f.write("YARA: NOT INSTALLED (Module Missing)\n\n")
+        else:
+             f.write("YARA: FAILED (Rules file not found or compile error)\n\n")
 
         for zone in hunt_zones:
             if not os.path.exists(zone):
@@ -3183,218 +3219,241 @@ def fase_metamorphosis_hunter(palabras, modo, target_file=None):
     if cancelar_escaneo:
         return
 
-    print("[25/25] Metamorphosis + DLL Injection Hunter [FORENSIC | NO FP | FAST]")
+    print("[25/25] Metamorphosis, Ghost Exe/DLL & Injection [NUCLEAR]")
 
-    import yara, psutil, pefile, hashlib
+    import ctypes, struct, math, datetime, psutil, pefile
+    from collections import Counter
+
+    # --- YARA GLOBAL ---
+    global GLOBAL_YARA_RULES
+    yara_rules = GLOBAL_YARA_RULES
+    if yara_rules is None:
+        try:
+            import yara
+            try: path_rules = resource_path("reglas_scanneler.yar")
+            except: path_rules = "reglas_scanneler.yar"
+            yara_rules = yara.compile(filepath=path_rules)
+        except: yara_rules = None
 
     start_time = time.time()
     MAX_TIME = 300
-    MAX_FILES = 2500
-    MAX_DLLS = 1200
+    
+    # --- CONSTANTES USN & WINAPI ---
+    USN_REASON_DATA_EXTEND     = 0x00000004
+    USN_REASON_DATA_TRUNCATION = 0x00000020
+    USN_REASON_FILE_CREATE     = 0x00000100
+    USN_REASON_FILE_DELETE     = 0x00000200 
+    USN_REASON_CLOSE           = 0x80000000 
+    
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    FSCTL_QUERY_USN_JOURNAL = 0x000900f4
+    FSCTL_READ_USN_JOURNAL = 0x000900bb
 
-    # ===================== CONFIG =====================
-    GAME_PROCESSES = [
-        "cs2.exe", "csgo.exe", "valorant.exe",
-        "fortniteclient-win64-shipping.exe",
-        "rustclient.exe", "gta5.exe"
-    ]
+    class USN_JOURNAL_DATA_V0(ctypes.Structure):
+        _fields_ = [("UsnJournalID", ctypes.c_ulonglong), ("FirstUsn", ctypes.c_ulonglong),
+                    ("NextUsn", ctypes.c_ulonglong), ("LowestValidUsn", ctypes.c_ulonglong),
+                    ("MaxUsn", ctypes.c_ulonglong), ("MaximumSize", ctypes.c_ulonglong),
+                    ("AllocationDelta", ctypes.c_ulonglong)]
 
-    SYSTEM_DLLS = {
-        "kernel32.dll", "ntdll.dll", "user32.dll",
-        "advapi32.dll", "gdi32.dll", "win32u.dll"
-    }
+    class READ_USN_JOURNAL_DATA_V0(ctypes.Structure):
+        _fields_ = [("StartUsn", ctypes.c_ulonglong), ("ReasonMask", ctypes.c_uint),
+                    ("ReturnOnlyOnClose", ctypes.c_uint), ("Timeout", ctypes.c_ulonglong),
+                    ("BytesToWaitFor", ctypes.c_ulonglong), ("UsnJournalID", ctypes.c_ulonglong)]
 
-    SYSTEM_PATHS = (
-        r"c:\windows\system32",
-        r"c:\windows\syswow64"
-    )
+    # --- HELPER: ENTROPÍA ---
+    def name_entropy(name):
+        if not name: return 0
+        c = Counter(name)
+        l = len(name)
+        return -sum((n/l) * math.log(n/l, 2) for n in c.values())
 
-    WRITABLE_PATHS = ("temp", "appdata", "downloads", "desktop")
+    # --- HELPER: LEER USN ÚLTIMA HORA ---
+    def get_usn_events_last_hour():
+        events = []
+        vol_handle = ctypes.windll.kernel32.CreateFileW(r"\\.\C:", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
+        if vol_handle == -1: return []
 
-    # ===================== YARA =====================
-    yara_rules = None
-    try:
-        yara_rules = yara.compile(filepath="reglas_scanneler.yar")
-    except:
-        pass
+        try:
+            journal_data = USN_JOURNAL_DATA_V0()
+            bytes_ret = ctypes.c_ulong()
+            ctypes.windll.kernel32.DeviceIoControl(vol_handle, FSCTL_QUERY_USN_JOURNAL, None, 0, ctypes.byref(journal_data), ctypes.sizeof(journal_data), ctypes.byref(bytes_ret), None)
+            
+            # Leer últimos 120MB (Más historial para asegurar)
+            read_data = READ_USN_JOURNAL_DATA_V0()
+            read_data.StartUsn = max(0, journal_data.NextUsn - (120 * 1024 * 1024))
+            read_data.ReasonMask = 0xFFFFFFFF
+            read_data.ReturnOnlyOnClose = 0
+            read_data.UsnJournalID = journal_data.UsnJournalID
+            
+            buf = ctypes.create_string_buffer(65536)
+            limit_time = datetime.datetime.now() - datetime.timedelta(hours=1)
+            
+            while True:
+                if cancelar_escaneo: break
+                if not ctypes.windll.kernel32.DeviceIoControl(vol_handle, FSCTL_READ_USN_JOURNAL, ctypes.byref(read_data), ctypes.sizeof(read_data), buf, 65536, ctypes.byref(bytes_ret), None): break
+                if bytes_ret.value < 8: break
+                
+                read_data.StartUsn = struct.unpack_from('<Q', buf, 0)[0]
+                offset = 8
+                while offset < bytes_ret.value:
+                    if offset + 60 > bytes_ret.value: break
+                    reclen = struct.unpack_from('<I', buf, offset)[0]
+                    if reclen == 0: break
+                    
+                    reason = struct.unpack_from('<I', buf, offset + 40)[0]
+                    
+                    # FILTRO DE INTERÉS: Crea, Borra, Cambia Tamaño o CIERRA
+                    mask_interest = (USN_REASON_FILE_CREATE | USN_REASON_DATA_TRUNCATION | 
+                                     USN_REASON_DATA_EXTEND | USN_REASON_FILE_DELETE | USN_REASON_CLOSE)
+                    
+                    if (reason & mask_interest):
+                        ts = struct.unpack_from('<Q', buf, offset + 32)[0]
+                        dt = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ts/10)
+                        
+                        if dt > limit_time:
+                            fn_len = struct.unpack_from('<H', buf, offset + 56)[0]
+                            fn_off = struct.unpack_from('<H', buf, offset + 58)[0]
+                            name = buf[offset+fn_off : offset+fn_off+fn_len].decode('utf-16-le', 'ignore')
+                            events.append({'time': dt, 'name': name, 'reason': reason})
+                    offset += reclen
+        except: pass
+        finally: ctypes.windll.kernel32.CloseHandle(vol_handle)
+        return events
 
-    # ===================== PREFETCH =====================
-    prefetch_map = {}
-    try:
-        for f in os.scandir(r"C:\Windows\Prefetch"):
-            if f.name.endswith(".PF"):
-                exe = f.name.split("-")[0].lower()
-                prefetch_map[exe] = f.stat().st_mtime
-    except:
-        pass
-
-    # ===================== USN CACHE =====================
-    usn_db = {}
-    try:
-        proc = subprocess.Popen(
-            "fsutil usn readjournal C: csv",
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            shell=True, text=True, creationflags=0x08000000
-        )
-        t0 = time.time()
-        while time.time() - t0 < 2.5:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            parts = line.split(",")
-            if len(parts) > 6 and parts[-1].lower().endswith(".exe"):
-                usn_db.setdefault(parts[-1].lower(), []).append(parts[5])
-        proc.terminate()
-    except:
-        pass
-
-    # ===================== FILE DISCOVERY =====================
-    files_to_scan = []
-
-    if target_file and os.path.exists(target_file):
-        files_to_scan.append(target_file)
-    else:
-        roots = [
-            os.path.join(os.environ["USERPROFILE"], "Desktop"),
-            os.path.join(os.environ["USERPROFILE"], "Downloads"),
-            os.path.join(os.environ["USERPROFILE"], "AppData", "Local", "Temp")
-        ]
-        for root in roots:
-            for r, _, files in os.walk(root):
-                for f in files:
-                    if f.lower().endswith(".exe"):
-                        files_to_scan.append(os.path.join(r, f))
-                        if len(files_to_scan) >= MAX_FILES:
-                            break
-
-    # ===================== REPORT =====================
+    # --- EJECUCIÓN DEL REPORTE ---
     base_path = HISTORIAL_RUTAS.get("path", os.path.abspath("."))
     folder = HISTORIAL_RUTAS.get("folder", "Resultados_SS")
     os.makedirs(os.path.join(base_path, folder), exist_ok=True)
     report_path = os.path.join(base_path, folder, "Metamorphosis_DLL_Report.txt")
 
     with open(report_path, "w", encoding="utf-8", buffering=1) as report:
-        report.write("=== FASE 25 – METAMORPHOSIS + DLL INJECTION (NO FP) ===\n\n")
+        report.write("=== FASE 25: METAMORPHOSIS & GHOST HUNTER ===\n")
+        report.write(f"Scan Time: {datetime.datetime.now()}\n")
+        report.write(f"YARA Status: {'ACTIVE' if yara_rules else 'OFF'}\n\n")
 
-        detections = 0
-
-        # =====================================================
-        # PART A – METAMORPHOSIS (AUTODESTRUCT / HOT-SWAP)
-        # =====================================================
-        for fp in files_to_scan:
-            if time.time() - start_time > MAX_TIME:
-                break
-            try:
-                st = os.stat(fp)
-                fname = os.path.basename(fp).lower()
-                score = 0
-                evidence = []
-
-                if st.st_size < 2 * 1024 * 1024:
-                    score += 2
-                    evidence.append("Executable unusually small")
-
-                if fname in prefetch_map and st.st_mtime > prefetch_map[fname] + 5:
-                    score += 5
-                    evidence.append("Modified AFTER execution (Prefetch paradox)")
-
-                for r in usn_db.get(fname, []):
-                    if "TRUNCATION" in r:
-                        score += 2
-                        evidence.append("USN: DATA_TRUNCATION")
-                    if "OVERWRITE" in r:
-                        score += 1
-                        evidence.append("USN: DATA_OVERWRITE")
-
-                if score >= 6:
-                    detections += 1
-                    report.write(f"[METAMORPHOSIS] {fp}\n")
-                    for e in evidence:
-                        report.write(f"  - {e}\n")
-                    report.write("\n")
-
-            except:
-                pass
+        events = get_usn_events_last_hour()
 
         # =====================================================
-        # PART B – DLL INJECTION (REAL CHEATS ONLY)
+        # PART A: SIZE ANOMALIES (METAMORPHOSIS)
         # =====================================================
-        dll_checked = 0
+        report.write("--- [PART A] SIZE ANOMALIES (LAST 1 HOUR) ---\n")
+        count_a = 0
+        for e in events:
+            if cancelar_escaneo: break
+            name = e['name']
+            r = e['reason']
+            t_str = e['time'].strftime('%H:%M:%S')
+            
+            if any(x in name.lower() for x in [".log", ".tmp", ".dat", "ntuser", "$logfile"]): continue
+            
+            tags = []
+            if r & USN_REASON_DATA_TRUNCATION: tags.append("SHRANK")
+            if r & USN_REASON_DATA_EXTEND: tags.append("GREW")
+            if r & USN_REASON_FILE_CREATE:
+                ent = name_entropy(name.split('.')[0])
+                if ent > 4.0 and len(name.split('.')[0]) > 6: tags.append(f"RANDOM NAME")
+            
+            if tags:
+                report.write(f"[{t_str}] {' + '.join(tags)}: {name}\n")
+                count_a += 1
+        
+        if count_a == 0: report.write("[OK] Clean.\n")
+        report.write("\n")
 
+        # =====================================================
+        # PART B: GHOST EXECUTION (EXE/DLL UNLOADED OR DELETED)
+        # =====================================================
+        report.write("--- [PART B] GHOST EXECUTABLES (CLOSED/DELETED < 1 HOUR) ---\n")
+        report.write("Detects files (.exe/.dll) closed or deleted recently (Panic Key/Bypass).\n")
+        
+        # AQUI AGREGAMOS .exe
+        suspicious_extensions = (".dll", ".exe", ".tmp", ".bat", ".ps1") 
+        
+        count_b = 0
+        for e in events:
+            name_low = e['name'].lower()
+            if not name_low.endswith(suspicious_extensions): continue
+            
+            # Whitelist básica de sistema
+            if any(x in name_low for x in ["microsoft", "windows", "defender", "update", "installer", "chrome", "edge", "steam", "discord"]): continue
+
+            r = e['reason']
+            t_str = e['time'].strftime('%H:%M:%S')
+            
+            is_ghost = False
+            ghost_type = ""
+
+            # CASO 1: Archivo Borrado (Muy sospechoso)
+            if r & USN_REASON_FILE_DELETE:
+                is_ghost = True
+                ghost_type = "DELETED (Panic Key?)"
+
+            # CASO 2: Archivo Cerrado (Dejó de ejecutarse)
+            elif r & USN_REASON_CLOSE:
+                is_ghost = True
+                ghost_type = "CLOSED/UNLOADED"
+
+            if is_ghost:
+                report.write(f"[{t_str}] [!!!] {ghost_type}: {e['name']}\n")
+                count_b += 1
+
+        if count_b == 0: report.write("[OK] No suspicious execution stops found.\n")
+        report.write("\n")
+
+        # =====================================================
+        # PART C: LIVE DLL INJECTION (MEMORY)
+        # =====================================================
+        report.write("--- [PART C] LIVE TOXIC DLLs (CURRENTLY ACTIVE) ---\n")
+        
+        GAME_PROCESSES = ["cs2.exe", "csgo.exe", "valorant.exe", "fortniteclient-win64-shipping.exe", "gta5.exe", "fivem.exe", "dota2.exe", "rustclient.exe"]
+        SYSTEM_DLLS = {"kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll", "gdi32.dll", "win32u.dll", "wow64.dll", "version.dll", "shlwapi.dll", "ws2_32.dll"}
+        WRITABLE_PATHS = ("temp", "appdata", "downloads", "desktop")
+        
+        dll_found = 0
+        
         for proc in psutil.process_iter(["pid", "name", "exe"]):
-            if time.time() - start_time > MAX_TIME:
-                break
-
+            if cancelar_escaneo or (time.time() - start_time > MAX_TIME): break
             try:
                 pname = proc.info["name"].lower()
-                if pname not in GAME_PROCESSES:
-                    continue
+                if pname not in GAME_PROCESSES: continue
+                
+                try: maps = proc.memory_maps()
+                except: continue
 
-                for m in proc.memory_maps():
+                for m in maps:
                     path = m.path
-                    if not path or not path.lower().endswith(".dll"):
-                        continue
+                    if not path or not path.lower().endswith(".dll"): continue
+                    if os.path.basename(path).lower() in SYSTEM_DLLS: continue
+                    if path.lower().startswith((r"c:\windows\system32", r"c:\windows\syswow64", r"c:\program files")): continue
 
-                    dll = os.path.basename(path).lower()
-                    if dll in SYSTEM_DLLS:
-                        continue
-
-                    lp = path.lower()
-                    if lp.startswith(SYSTEM_PATHS):
-                        continue
-
-                    dll_checked += 1
-                    if dll_checked > MAX_DLLS:
-                        break
-
-                    score = 0
-                    evidence = []
-
-                    if any(w in lp for w in WRITABLE_PATHS):
-                        score += 2
-                        evidence.append("DLL loaded from writable path")
+                    score_dll = 0
+                    ev_dll = []
+                    
+                    if any(w in path.lower() for w in WRITABLE_PATHS):
+                        score_dll += 3
+                        ev_dll.append("Risky Path (User Writable)")
 
                     if yara_rules:
                         try:
-                            matches = yara_rules.match(path)
-                            if matches:
-                                score += 6
-                                evidence.append(f"YARA MATCH: {[m.rule for m in matches]}")
-                        except:
-                            pass
+                            if yara_rules.match(filepath=path):
+                                score_dll += 10
+                                ev_dll.append("YARA MATCH")
+                        except: pass
 
-                    try:
-                        pe = pefile.PE(path, fast_load=True)
-                        pe.parse_data_directories(
-                            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
-                        )
-                        for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
-                            for imp in entry.imports:
-                                if imp.name:
-                                    api = imp.name.decode(errors="ignore").lower()
-                                    if api in (
-                                        "writeprocessmemory",
-                                        "createremotethread",
-                                        "ntwritevirtualmemory"
-                                    ):
-                                        score += 1
-                                        evidence.append(f"Memory API: {api}")
-                    except:
-                        pass
-
-                    if score >= 7:
-                        detections += 1
-                        report.write(f"[DLL CHEAT] {path}\n")
-                        report.write(f"  Process: {proc.info['name']} (PID {proc.pid})\n")
-                        for e in evidence:
-                            report.write(f"  - {e}\n")
+                    if score_dll >= 3:
+                        dll_found += 1
+                        report.write(f"[TOXIC DLL] {os.path.basename(path)}\n")
+                        report.write(f"  In: {pname} (PID {proc.pid})\n")
+                        report.write(f"  Path: {path}\n")
+                        for e in ev_dll: report.write(f"  - {e}\n")
                         report.write("\n")
-
-            except:
-                pass
-
-        report.write(f"\nScan finished. Detections: {detections}\n")
-        report.write(f"Elapsed: {time.time() - start_time:.2f}s\n")
+            except: pass
+            
+        if dll_found == 0: report.write("[OK] No toxic DLLs currently injected.\n")
 
 
             
